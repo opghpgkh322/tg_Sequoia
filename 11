@@ -1,0 +1,179 @@
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = "7617868509:AAFf1Bfj6M872KnDMrrMHm6q5PzyYNjpsgs"
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+class Form(StatesGroup):
+    waiting_for_instructor = State()
+    waiting_for_park = State()
+    waiting_for_print = State()
+    waiting_for_document = State()
+    waiting_for_month = State()
+    in_section = State()
+
+# Улучшенные клавиатуры
+def build_keyboard(buttons: list, row_width: int = 2):
+    builder = ReplyKeyboardBuilder()
+    for button in buttons:
+        builder.add(KeyboardButton(text=button))
+    builder.adjust(row_width)
+    return builder.as_markup(resize_keyboard=True)
+
+def get_main_menu():
+    return build_keyboard([
+        "Инструкции", "Обучение инструкторов",
+        "Как проходит месяц", "Заказать полиграфию",
+        "Документы", "Выход"
+    ], 2)
+
+def get_instructions_menu():
+    return build_keyboard([
+        "Как именовать документы", "График и зп табель",
+        "Инспекция ИСС", "Обход трасс",
+        "Инвентаризация", "Отчет по наличным",
+        "Кассовая дисциплина", "Вернуться к меню"
+    ], 2)
+
+def get_instructors_menu():
+    return build_keyboard([
+        "Чек-лист стажёра", "Вернуться к меню"
+    ], 2)
+
+def get_parks_menu():
+    return build_keyboard(["Кошкино", "Уктус", "Дубрава", "Нижний", "Тюмень", "Назад"], 2)
+
+def get_print_menu():
+    return build_keyboard([
+        "Типография для квестов", "Карта парка",
+        "Таблички на деревья", "Кассовый домик",
+        "Остальная полиграфия", "Вернуться к меню"
+    ], 2)
+
+def get_document_menu():
+    return build_keyboard([
+        "Бланк для возврата", "Уголок потребителя",
+        "Справочник", "Вернуться к меню"
+    ], 2)
+
+# Обработчики с улучшенной логикой
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await message.answer("Добро пожаловать! Выбери действие:", reply_markup=get_main_menu())
+
+@dp.message(lambda message: message.text == "Инструкции")
+async def select_instructions(message: types.Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_instructor)
+    await message.answer("📋 Выбери инструкцию:", reply_markup=get_instructions_menu())
+
+@dp.message(lambda message: message.text == "Обучение инструкторов")
+async def select_instructors(message: types.Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_instructor)
+    await message.answer("👨‍🏫 Выбери раздел обучения:", reply_markup=get_instructors_menu())
+
+@dp.message(lambda message: message.text == "Как проходит месяц")
+async def select_month_park(message: types.Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_park)
+    await state.update_data(section="Как проходит месяц")
+    await message.answer("📅 Выбери парк:", reply_markup=get_parks_menu())
+
+@dp.message(lambda message: message.text == "Заказать полиграфию")
+async def select_print_park(message: types.Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_park)
+    await state.update_data(section="Заказать полиграфию")
+    await message.answer("🖨 Выбери парк:", reply_markup=get_parks_menu())
+
+@dp.message(lambda message: message.text == "Документы")
+async def select_document_park(message: types.Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_park)
+    await state.update_data(section="Документы")
+    await message.answer("📂 Выбери парк:", reply_markup=get_parks_menu())
+
+@dp.message(Form.waiting_for_instructor)
+async def process_instructions(message: types.Message, state: FSMContext):
+    if message.text == "Вернуться к меню":
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    await state.set_state(Form.in_section)
+    await state.update_data(current_section=message.text)
+    if message.text == "Чек-лист стажёра":
+        await message.answer(f"👨‍🏫 Чек-лист стажёра - здесь будет текст раздела", reply_markup=get_main_menu())
+    else:
+        await message.answer(f"📋 {message.text} - здесь будет текст раздела", reply_markup=get_instructions_menu())
+
+@dp.message(Form.waiting_for_park)
+async def process_park(message: types.Message, state: FSMContext):
+    if message.text == "Назад":
+        await state.clear()
+        await cmd_start(message, state)
+        return
+
+    data = await state.get_data()
+    park = message.text
+    section = data.get("section")
+
+    await state.set_state(Form.in_section)
+    await state.update_data(current_park=park)
+
+    if section == "Как проходит месяц":
+        await message.answer(f"📅 Календарь для парка {park} ", reply_markup=get_main_menu())
+    elif section == "Заказать полиграфию":
+        await state.set_state(Form.waiting_for_print)
+        await message.answer(f"🖨 Выбери раздел полиграфии для парка {park}:", reply_markup=get_print_menu())
+    elif section == "Документы":
+        await state.set_state(Form.waiting_for_document)
+        await message.answer(f"📂 Выбери раздел документов для парка {park}:", reply_markup=get_document_menu())
+
+@dp.message(Form.waiting_for_print)
+async def process_print(message: types.Message, state: FSMContext):
+    if message.text == "Вернуться к меню":
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    await state.set_state(Form.in_section)
+    await state.update_data(current_section=message.text)
+    data = await state.get_data()
+    park = data.get("current_park")
+    await message.answer(f"🖨 {message.text} для парка {park} - здесь будет текст раздела", reply_markup=get_print_menu())
+
+@dp.message(Form.waiting_for_document)
+async def process_document(message: types.Message, state: FSMContext):
+    if message.text == "Вернуться к меню":
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    await state.set_state(Form.in_section)
+    await state.update_data(current_section=message.text)
+    data = await state.get_data()
+    park = data.get("current_park")
+    await message.answer(f"📂 {message.text} для парка {park} - здесь будет текст раздела", reply_markup=get_document_menu())
+
+@dp.message(Form.in_section)
+async def process_section(message: types.Message, state: FSMContext):
+    if "Вернуться к меню" in message.text:
+        await state.clear()
+        await cmd_start(message, state)
+
+@dp.message()
+async def handle_other(message: types.Message):
+    await message.answer("ℹ Используйте кнопки меню для навигации", reply_markup=get_main_menu())
+
+if __name__ == '__main__':
+    logger.info("Бот запущен")
+    try:
+        dp.run_polling(bot)
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+
+
