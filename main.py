@@ -10,6 +10,7 @@ import sqlite3
 import datetime
 from datetime import timedelta
 import asyncio
+from zoneinfo import ZoneInfo
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "7966741550:AAGHPUd8hnGjfd-VNv3cO4j8-ZCHS8R6jwc"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Часовые пояса
+MSK_TZ = ZoneInfo("Europe/Moscow")
+UTC_TZ = ZoneInfo("UTC")
 
 # Список разрешенных пользователей
 ALLOWED_USERS = {
@@ -158,13 +163,13 @@ def clean_old_events(days=1):
         c = conn.cursor()
 
         # Удаляем события, которые завершились раньше чем X дней назад
-        delete_time = (datetime.datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        delete_time_utc = (datetime.datetime.now(UTC_TZ) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
         # Логируем перед удалением
-        c.execute("SELECT COUNT(*) FROM events WHERE event_date < ?", (delete_time,))
+        c.execute("SELECT COUNT(*) FROM events WHERE event_date < ?", (delete_time_utc,))
         count_before = c.fetchone()[0]
 
-        c.execute("DELETE FROM events WHERE event_date < ?", (delete_time,))
+        c.execute("DELETE FROM events WHERE event_date < ?", (delete_time_utc,))
         deleted_count = c.rowcount
         conn.commit()
 
@@ -257,17 +262,16 @@ def get_inspection_menu():
 # Функции для работы с календарем
 def save_event(event_date, event_text, remind_before, user_id, chat_id, comment=""):
     try:
-        # Парсим введенную дату как локальное время
+        # Парсим введенную дату как наивное время (предполагаем MSK)
         naive_dt = datetime.datetime.strptime(event_date, "%d.%m.%Y %H:%M")
         logger.info(f"Введенное время (наивное): {naive_dt}")
 
-        # Предполагаем, что время вводится в часовом поясе сервера
-        local_tz = datetime.datetime.now().astimezone().tzinfo
-        local_dt = naive_dt.replace(tzinfo=local_tz)
-        logger.info(f"Введенное время (с TZ): {local_dt}")
+        # Добавляем MSK TZ
+        msk_dt = naive_dt.replace(tzinfo=MSK_TZ)
+        logger.info(f"Введенное время (MSK): {msk_dt}")
 
         # Преобразуем в UTC
-        utc_dt = local_dt.astimezone(datetime.timezone.utc)
+        utc_dt = msk_dt.astimezone(UTC_TZ)
         event_date_sql = utc_dt.strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"Сохраненное время (UTC): {event_date_sql}")
 
@@ -303,7 +307,8 @@ def get_user_events(user_id):
     """Получаем все будущие события пользователя"""
     conn = sqlite3.connect('events.db')
     c = conn.cursor()
-    c.execute("SELECT * FROM events WHERE user_id=? AND event_date >= datetime('now') ORDER BY event_date", (user_id,))
+    now_utc = datetime.datetime.now(UTC_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("SELECT * FROM events WHERE user_id=? AND event_date >= ? ORDER BY event_date", (user_id, now_utc))
     events = c.fetchall()
 
     # Логируем структуру события
@@ -318,20 +323,17 @@ def get_events_to_remind():
     conn = sqlite3.connect('events.db')
     c = conn.cursor()
 
-    # Получаем текущее время в UTC и локальное время для логирования
-    c.execute("SELECT datetime('now'), datetime('now', 'localtime')")
-    now_utc, now_local = c.fetchone()
-    logger.info(f"Текущее время UTC: {now_utc}, Локальное: {now_local}")
+    # Получаем текущее время в UTC
+    now_utc = datetime.datetime.now(UTC_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(f"Текущее время UTC: {now_utc}")
 
-    # Улучшенный запрос с логированием условий
+    # Запрос в UTC
     query = """
         SELECT 
-            id, park, event_date, event_text, remind_before, user_id, chat_id, reminded, comment,
-            datetime(event_date, 'localtime') AS local_event_date,
-            datetime('now', 'localtime', '+' || remind_before || ' minutes') AS reminder_time
+            id, park, event_date, event_text, remind_before, user_id, chat_id, reminded, comment
         FROM events 
         WHERE reminded = 0 
-        AND datetime(event_date, 'localtime') <= datetime('now', 'localtime', '+' || remind_before || ' minutes')
+        AND datetime(event_date, '-' || remind_before || ' minutes') <= datetime('now')
         """
 
     try:
@@ -341,26 +343,11 @@ def get_events_to_remind():
         logger.error(f"Ошибка SQL при выборе событий: {e}")
         events = []
 
-    # Логируем условие напоминания
-    try:
-        # Вычисляем время, когда должно сработать напоминание
-        c.execute("SELECT datetime('now', 'localtime', '+' || ? || ' minutes')", (5,))
-        example_time = c.fetchone()[0]
-        logger.info(f"Пример времени напоминания (для 5 минут): {example_time}")
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при вычислении примера времени: {e}")
-
     logger.info(f"Найдено событий: {len(events)}")
 
     for event in events:
-        # Извлекаем 10 значений из кортежа
-        (event_id, park, event_date, event_text, remind_before,
-         user_id, chat_id, reminded, local_event_date, reminder_time, comment) = event
-
-        # Теперь используем только нужные нам поля
-        logger.info(f"Событие ID {event_id}: "
-                    f"Дата (локальная): {local_event_date}, "
-                    f"Время напоминания: {reminder_time}")
+        event_id, park, event_date, event_text, remind_before, user_id, chat_id, reminded, comment = event
+        logger.info(f"Событие ID {event_id}: Дата (UTC): {event_date}")
 
     conn.close()
     return events
@@ -390,25 +377,16 @@ async def check_reminders():
                 logger.warning("Нет пользователей для рассылки напоминаний")
 
             for event in events:
-                # Правильная распаковка 11 значений
-                event_id = event[0]
-                park = event[1]
-                event_date_utc = event[2]  # UTC время
-                event_text = event[3]
-                remind_minutes = event[4]
-                user_id = event[5]
-                chat_id_val = event[6]  # chat_id из базы
-                reminded_flag = event[7]
-                comment = event[8]  # Комментарий
-                local_event_date = event[9]  # Локальное время (строка)
-                reminder_time = event[10]  # Время напоминания
+                # Распаковка 9 значений
+                event_id, park, event_date_utc, event_text, remind_minutes, user_id, chat_id_val, reminded_flag, comment = event
 
                 # Преобразуем минуты в часы
                 hours = remind_minutes // 60
 
-                # Преобразуем строку локального времени в объект datetime
-                event_local_dt = datetime.datetime.strptime(local_event_date, "%Y-%m-%d %H:%M:%S")
-                event_time_str = event_local_dt.strftime("%d.%m.%Y %H:%M")
+                # Конвертируем UTC в MSK для отображения
+                utc_dt = datetime.datetime.strptime(event_date_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC_TZ)
+                msk_dt = utc_dt.astimezone(MSK_TZ)
+                event_time_str = msk_dt.strftime("%d.%m.%Y %H:%M")
 
                 # Формируем текст напоминания
                 reminder_text = (
@@ -419,8 +397,6 @@ async def check_reminders():
 
                 if comment:
                     reminder_text += f"\n💬 Комментарий: {comment}\n\n"
-
-
 
                 # Отправляем всем авторизованным пользователям
                 for user_chat_id in chat_ids:
@@ -547,8 +523,10 @@ async def process_comment(message: types.Message, state: FSMContext, **kwargs):
         comment=comment  # Передаем комментарий
     )
 
-    # Форматируем дату для подтверждения
-    formatted_date = datetime.datetime.strptime(data['event_date'], "%d.%m.%Y %H:%M").strftime("%d %B %Y в %H:%M")
+    # Форматируем дату для подтверждения (в MSK)
+    naive_dt = datetime.datetime.strptime(data['event_date'], "%d.%m.%Y %H:%M")
+    msk_dt = naive_dt.replace(tzinfo=MSK_TZ)
+    formatted_date = msk_dt.strftime("%d %B %Y в %H:%M")
     response = (
         f"✅ Событие успешно добавлено!\n\n"
         f" Дедлайн: {formatted_date}\n"
@@ -581,13 +559,12 @@ async def show_user_events(message: types.Message, **kwargs):
         event_date_utc = event[2]  # UTC время
         event_text = event[3]
         remind_minutes = event[4]
-        comment = event[8]  # Комментарий
+        comment = event[8] if len(event) > 8 else ""  # Комментарий (с проверкой)
 
-        # Преобразуем UTC время в локальное
-        utc_dt = datetime.datetime.strptime(event_date_utc, "%Y-%m-%d %H:%M:%S")
-        utc_dt = utc_dt.replace(tzinfo=datetime.timezone.utc)
-        local_dt = utc_dt.astimezone()
-        event_time = local_dt.strftime("%d.%m.%Y %H:%M")
+        # Конвертируем UTC в MSK
+        utc_dt = datetime.datetime.strptime(event_date_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC_TZ)
+        msk_dt = utc_dt.astimezone(MSK_TZ)
+        event_time = msk_dt.strftime("%d.%m.%Y %H:%M")
 
         # Преобразуем минуты в часы
         hours = remind_minutes // 60
@@ -618,9 +595,13 @@ async def delete_event_start(message: types.Message, state: FSMContext, **kwargs
     response = "📅 Ваши предстоящие события:\n\n"
     for event in events:
         event_id = event[0]
-        event_date = event[2]
+        event_date_utc = event[2]
         event_text = event[3]
-        event_time = datetime.datetime.strptime(event_date, "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
+
+        # Конвертируем в MSK
+        utc_dt = datetime.datetime.strptime(event_date_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC_TZ)
+        msk_dt = utc_dt.astimezone(MSK_TZ)
+        event_time = msk_dt.strftime("%d.%m.%Y %H:%M")
 
         response += f"🆔 ID: {event_id}\n"
         response += f"⏰ Время: {event_time}\n"
