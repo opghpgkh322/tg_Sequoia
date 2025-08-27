@@ -11,12 +11,15 @@ import datetime
 from datetime import timedelta
 import asyncio
 from zoneinfo import ZoneInfo
+import sys
+from pathlib import Path
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "7966741550:AAGHPUd8hnGjfd-VNv3cO4j8-ZCHS8R6jwc"
+BOT_TOKEN = "8385302636:AAHDgQF-rHDr__1Iov9v8iIixKI5vK8oeJ8"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -989,22 +992,44 @@ async def handle_other(message: types.Message, **kwargs):
 
 # Новый способ запуска бота
 async def main():
-    # Запускаем фоновые задачи
-    asyncio.create_task(check_reminders())
-    asyncio.create_task(clean_old_events_task())
+    # Принудительно закрываем все предыдущие соединения
+    await bot.delete_webhook(drop_pending_updates=True)
+    await asyncio.sleep(1)  # Даем время на закрытие соединений
+
+    # Создаем задачи для фоновых процессов
+    reminder_task = asyncio.create_task(check_reminders())
+    clean_task = asyncio.create_task(clean_old_events_task())
 
     try:
         # Запускаем бота
-        await dp.start_polling(bot, skip_updates=True)
+        logger.info("Бот успешно запущен")
+        await asyncio.sleep(5)  # Задержка 5 секунд перед запуском polling
+        await dp.start_polling(bot, skip_updates=True, allowed_updates=[])
+    except asyncio.CancelledError:
+        logger.info("Получен сигнал остановки бота")
     except Exception as e:
         logger.error(f"Ошибка при запуске бота: {e}")
     finally:
+        # Отменяем только наши фоновые задачи, а не все
+        reminder_task.cancel()
+        clean_task.cancel()
+
+        # Ждем завершения только наших задач
+        try:
+            await asyncio.wait_for(asyncio.gather(reminder_task, clean_task, return_exceptions=True), timeout=3.0)
+        except asyncio.TimeoutError:
+            logger.warning("Таймаут при ожидании завершения задач")
+
+        # Закрываем сессию бота
         await bot.session.close()
+        logger.info("Бот полностью остановлен")
 
 
 if __name__ == '__main__':
-    logger.info("Бот запущен")
+    # Простой запуск с обработкой KeyboardInterrupt
     try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен по запросу пользователя")
     except Exception as e:
         logger.error(f"Ошибка: {e}")
