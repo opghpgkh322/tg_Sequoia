@@ -117,6 +117,7 @@ class Form(StatesGroup):
     waiting_for_event_to_delete = State()
     in_instructions = State()  # Новое состояние для раздела инструкций
     in_training = State()  # Новое состояние для обучения
+    in_calendar = State()
 
 
 # Функция проверки доступа
@@ -195,11 +196,23 @@ def get_main_menu(username: str = None):
         "Документы"
     ]
 
-    # Если пользователь администратор - добавляем кнопки событий
+    # Если пользователь администратор - добавляем кнопку календаря вместо отдельных кнопок событий
     if username and username in ADMIN_USERS:
-        base_buttons.extend(["Добавить событие", "Мои события", "Удалить событие"])
+        base_buttons.append("Календарь")  # Заменяем три кнопки на одну
 
     return build_keyboard(base_buttons, 3)
+
+# Добавим новую функцию для меню календаря
+def get_calendar_menu():
+    return build_keyboard([
+        "Добавить событие", "Мои события",
+        "Удалить событие", "Вернуться к меню"
+    ], 2)
+
+# Добавим функцию для кнопки отмены
+def get_cancel_keyboard():
+    return build_keyboard(["Отмена"], 1)
+
 
 
 def get_instructions_menu():
@@ -237,11 +250,6 @@ def get_parks_menu():
 
 
 
-def get_document_menu():
-    return build_keyboard([
-        "Бланк для возврата", "Уголок потребителя",
-        "Справочник", "Вернуться к меню"
-    ], 2)
 
 
 def get_schedule_menu():
@@ -445,6 +453,13 @@ async def cmd_start(message: types.Message, state: FSMContext, **kwargs):
 
     await message.answer("👋 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
 
+# Обработчик для кнопки "Календарь"
+@dp.message(lambda message: message.text == "Календарь")
+@access_check
+@admin_check
+async def calendar_menu(message: types.Message, state: FSMContext, **kwargs):
+    await state.set_state(Form.in_calendar)
+    await message.answer("📅 Меню календаря:", reply_markup=get_calendar_menu())
 
 
 @dp.message(lambda message: message.text == "Начало")
@@ -454,14 +469,26 @@ async def handle_start_button(message: types.Message, state: FSMContext, **kwarg
     await message.answer("👋 Добро пожаловать! Выберите действие:",
                          reply_markup=get_main_menu(username))
 
-# Новые обработчики для календаря
-@dp.message(lambda message: message.text == "Добавить событие")
+# Обработчики для кнопок в меню календаря
+@dp.message(Form.in_calendar, lambda message: message.text == "Добавить событие")
 @access_check
 @admin_check
 async def add_event_start(message: types.Message, state: FSMContext, **kwargs):
-    # Пропускаем выбор парка, сразу переходим к дате
     await state.set_state(Form.waiting_for_event_date)
-    await message.answer("Введите дату и время события в формате ДД.ММ.ГГГГ ЧЧ:ММ (например, 31.12.2025 15:00):")
+    await message.answer("Введите дату и время события в формате ДД.ММ.ГГГГ ЧЧ:ММ (например, 31.12.2025 15:00):",
+                         reply_markup=get_cancel_keyboard())
+
+# Обработчики для кнопки "Отмена" - должны быть объявлены ДО обработчиков ввода данных
+@dp.message(Form.waiting_for_event_date, lambda message: message.text == "Отмена")
+@dp.message(Form.waiting_for_event_text, lambda message: message.text == "Отмена")
+@dp.message(Form.waiting_for_remind_before, lambda message: message.text == "Отмена")
+@dp.message(Form.waiting_for_comment, lambda message: message.text == "Отмена")
+@dp.message(Form.waiting_for_event_to_delete, lambda message: message.text == "Отмена")
+@access_check
+@admin_check
+async def cancel_operation(message: types.Message, state: FSMContext, **kwargs):
+    await state.set_state(Form.in_calendar)
+    await message.answer("❌ Операция отменена.", reply_markup=get_calendar_menu())
 
 @dp.message(Form.waiting_for_event_date)
 @access_check
@@ -472,7 +499,7 @@ async def process_event_date(message: types.Message, state: FSMContext, **kwargs
         datetime.datetime.strptime(message.text, "%d.%m.%Y %H:%M")
         await state.update_data(event_date=message.text)
         await state.set_state(Form.waiting_for_event_text)
-        await message.answer("Введите описание события:")
+        await message.answer("Введите описание события:", reply_markup=get_cancel_keyboard())
     except ValueError:
         await message.answer("❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ ЧЧ:ММ (например, 31.12.2025 15:00)")
 
@@ -482,11 +509,8 @@ async def process_event_date(message: types.Message, state: FSMContext, **kwargs
 async def process_event_text(message: types.Message, state: FSMContext, **kwargs):
     await state.update_data(event_text=message.text)
     await state.set_state(Form.waiting_for_remind_before)
-    # Изменяем текст запроса на часы
-    await message.answer("За сколько часов до события напомнить? (введите целое число):")
+    await message.answer("За сколько часов до события напомнить? (введите целое число):", reply_markup=get_cancel_keyboard())
 
-
-@dp.message(Form.waiting_for_remind_before)
 @dp.message(Form.waiting_for_remind_before)
 @access_check
 @admin_check
@@ -501,10 +525,9 @@ async def process_remind_before(message: types.Message, state: FSMContext, **kwa
 
         # Переходим к вводу комментария
         await state.set_state(Form.waiting_for_comment)
-        await message.answer("💬 Добавьте комментарий к событию (или напишите '-' чтобы пропустить):")
+        await message.answer("💬 Добавьте комментарий к событию (или напишите '-' чтобы пропустить):", reply_markup=get_cancel_keyboard())
     except ValueError:
         await message.answer("❌ Пожалуйста, введите целое положительное число часов.")
-
 
 @dp.message(Form.waiting_for_comment)
 @access_check
@@ -523,7 +546,7 @@ async def process_comment(message: types.Message, state: FSMContext, **kwargs):
         remind_before=data['remind_before'],
         user_id=username,
         chat_id=message.chat.id,
-        comment=comment  # Передаем комментарий
+        comment=comment
     )
 
     # Форматируем дату для подтверждения (в MSK)
@@ -541,10 +564,10 @@ async def process_comment(message: types.Message, state: FSMContext, **kwargs):
         response += f"\n\n💬 Комментарий: {comment}"
 
     await message.answer(response)
-    await state.clear()
-    await cmd_start(message, state)
+    await state.set_state(Form.in_calendar)
+    await message.answer("📅 Меню календаря:", reply_markup=get_calendar_menu())
 
-@dp.message(lambda message: message.text == "Мои события")
+@dp.message(Form.in_calendar, lambda message: message.text == "Мои события")
 @access_check
 @admin_check
 async def show_user_events(message: types.Message, **kwargs):
@@ -552,7 +575,7 @@ async def show_user_events(message: types.Message, **kwargs):
     events = get_user_events(username)
 
     if not events:
-        await message.answer("📅 У вас нет предстоящих событий.")
+        await message.answer("📅 У вас нет предстоящих событий.", reply_markup=get_calendar_menu())
         return
 
     response = "📅 Ваши предстоящие события:\n\n"
@@ -580,10 +603,10 @@ async def show_user_events(message: types.Message, **kwargs):
         response += f"⏱ Напоминание за {hours} часов до события\n"
         response += "────────────────────\n"
 
-    await message.answer(response)
+    await message.answer(response, reply_markup=get_calendar_menu())
 
 
-@dp.message(lambda message: message.text == "Удалить событие")
+@dp.message(Form.in_calendar, lambda message: message.text == "Удалить событие")
 @access_check
 @admin_check
 async def delete_event_start(message: types.Message, state: FSMContext, **kwargs):
@@ -591,7 +614,7 @@ async def delete_event_start(message: types.Message, state: FSMContext, **kwargs
     events = get_user_events(username)
 
     if not events:
-        await message.answer("📅 У вас нет предстоящих событий для удаления.")
+        await message.answer("📅 У вас нет предстоящих событий для удаления.", reply_markup=get_calendar_menu())
         return
 
     # Формируем список событий с ID
@@ -611,9 +634,19 @@ async def delete_event_start(message: types.Message, state: FSMContext, **kwargs
         response += f"📝 Событие: {event_text}\n"
         response += "────────────────────\n"
 
-    response += "\nВведите ID события, которое хотите удалить:"
-    await message.answer(response)
+    response += "\nВведите ID события, которое хотите удалить (или нажмите 'Отмена'):"
+    await message.answer(response, reply_markup=get_cancel_keyboard())
     await state.set_state(Form.waiting_for_event_to_delete)
+
+# Обработчик для кнопки "Вернуться к меню" в календаре
+@dp.message(Form.in_calendar, lambda message: message.text == "Вернуться к меню")
+@access_check
+@admin_check
+async def calendar_back_to_main(message: types.Message, state: FSMContext, **kwargs):
+    await state.clear()
+    username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
+    await message.answer("👋 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
+
 
 
 @dp.message(Form.waiting_for_event_to_delete)
@@ -644,8 +677,8 @@ async def process_event_delete(message: types.Message, state: FSMContext, **kwar
     finally:
         if conn:
             conn.close()
-        await state.clear()
-        await cmd_start(message, state)
+        await state.set_state(Form.in_calendar)
+        await message.answer("📅 Меню календаря:", reply_markup=get_calendar_menu())
 
 @dp.message(lambda message: message.text == "Инструкции")
 @access_check
@@ -770,7 +803,7 @@ async def process_training(message: types.Message, state: FSMContext, **kwargs):
 async def select_document_park(message: types.Message, state: FSMContext, **kwargs):
     await state.set_state(Form.waiting_for_park)
     await state.update_data(section="Документы")
-    await message.answer("📂 Документы:", reply_markup=get_document_menu())
+    await message.answer("📂 Выберите парк для получения документов:", reply_markup=get_parks_menu())
 
 
 
@@ -959,27 +992,62 @@ async def process_park(message: types.Message, state: FSMContext, **kwargs):
     park = message.text
     section = data.get("section")
 
-    await state.set_state(Form.in_section)
-    await state.update_data(current_park=park)
-
-
+    # Обработка раздела "Документы"
     if section == "Документы":
-        await state.set_state(Form.waiting_for_document)
-        await message.answer(f"📂 Выбери раздел документов для парка {park}:", reply_markup=get_document_menu())
+        # Маппинг названий парков к именам файлов
+        park_file_mapping = {
+            "Дубрава": "Дубрава",
+            "Уктус": "Екатеринбург",
+            "Кошкино": "Кошкино",
+            "Нижний": "НН",
+            "Тюмень": "Тюмень"
+        }
+
+        if park in park_file_mapping:
+            file_prefix = park_file_mapping[park]
+
+            try:
+                # Отправляем бланк для возврата для конкретного парка
+                return_form_file = f"Бланк для возврата {file_prefix}.pdf"
+                with open(return_form_file, "rb") as file:
+                    await message.answer_document(
+                        BufferedInputFile(
+                            file.read(),
+                            filename=return_form_file
+                        ),
+                        caption=f"📄 Бланк для возврата - {park}"
+                    )
+
+                # Отправляем общий справочник
+                with open("Справочник.pdf", "rb") as file:
+                    await message.answer_document(
+                        BufferedInputFile(
+                            file.read(),
+                            filename="Справочник.pdf"
+                        ),
+                        caption="📚 Общий справочник"
+                    )
+
+                # Возвращаем в главное меню
+                await state.clear()
+                username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
+                await message.answer("Документы отправлены. Выберите действие:", reply_markup=get_main_menu(username))
+
+            except FileNotFoundError as e:
+                logger.error(f"Файл не найден: {e}")
+                await message.answer("❌ Файл документа не найден. Обратитесь к администратору.")
+                await state.clear()
+                await cmd_start(message, state)
+        else:
+            await message.answer("❌ Неверный выбор парка. Попробуйте еще раз.")
+    else:
+        # Обработка других разделов (если есть)
+        await state.set_state(Form.in_section)
+        await state.update_data(current_park=park)
+        await message.answer(f"Выбран парк {park} для раздела {section}")
 
 
-@dp.message(Form.waiting_for_document)
-@access_check
-async def process_document(message: types.Message, state: FSMContext, **kwargs):
-    if message.text == "Вернуться к меню":
-        await state.clear()
-        await cmd_start(message, state)
-        return
 
-    data = await state.get_data()
-    park = data.get("current_park")
-    await message.answer(f"📂 {message.text} для парка {park} - здесь будет текст раздела")
-    await message.answer(f"📂 Выбери раздел документов для парка {park}:", reply_markup=get_document_menu())
 
 
 @dp.message()
