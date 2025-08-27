@@ -397,7 +397,15 @@ async def check_reminders():
                 # Конвертируем UTC в MSK для отображения
                 utc_dt = datetime.datetime.strptime(event_date_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC_TZ)
                 msk_dt = utc_dt.astimezone(MSK_TZ)
-                event_time_str = msk_dt.strftime("%d.%m.%Y %H:%M")
+                # На следующий код:
+                month_names = [
+                    "января", "февраля", "марта", "апреля", "мая", "июня",
+                    "июля", "августа", "сентября", "октября", "ноября", "декабря"
+                ]
+                day = msk_dt.day
+                month = month_names[msk_dt.month - 1]
+                time_str = msk_dt.strftime("%H:%M")
+                event_time_str = f"{day} {month} {time_str}"
 
                 # Формируем текст напоминания
                 reminder_text = (
@@ -552,7 +560,14 @@ async def process_comment(message: types.Message, state: FSMContext, **kwargs):
     # Форматируем дату для подтверждения (в MSK)
     naive_dt = datetime.datetime.strptime(data['event_date'], "%d.%m.%Y %H:%M")
     msk_dt = naive_dt.replace(tzinfo=MSK_TZ)
-    formatted_date = msk_dt.strftime("%d %B %Y в %H:%M")
+    month_names = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря"
+    ]
+    day = msk_dt.day
+    month = month_names[msk_dt.month - 1]
+    time_str = msk_dt.strftime("%H:%M")
+    formatted_date = f"{day} {month} {msk_dt.year} в {time_str}"
     response = (
         f"✅ Событие успешно добавлено!\n\n"
         f" Дедлайн: {formatted_date}\n"
