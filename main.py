@@ -31,7 +31,13 @@ UTC_TZ = ZoneInfo("UTC")
 ALLOWED_USERS = {
     "@burgerking312",
     "@veron144ka",
-    "@DashaRyzhova"
+    "@DashaRyzhova",
+    "@loreley1264",
+    "@vaditmn",
+    "@olikburlakova",
+    "@milkenxxx",
+    "@astratov_roman"
+
 }
 
 ADMIN_USERS = {"@burgerking312","@veron144ka",  "@DashaRyzhova"}
