@@ -132,107 +132,139 @@ class Form(StatesGroup):
 
 
 async def send_compressed_video(message: types.Message, input_name: str, caption: str = None):
-    input_path = VIDEO_DIR / input_name
-    output_name = f"compressed_{input_name}"
-    output_path = VIDEO_DIR / output_name
+    # Абсолютные пути и базовая валидация
+    input_path = (VIDEO_DIR / input_name).resolve()
+    output_path = (VIDEO_DIR / f"compressed_{input_name}").resolve()
 
     try:
-        # Проверяем размер исходного файла
+        # 0) Проверяем наличие входного файла (ранний выход с понятным сообщением)
+        if not input_path.exists():
+            logger.error(f"Input missing: {repr(str(input_path))}")
+            await message.answer(f"❌ Файл не найден: {input_name}")
+            return
+
+        # 1) Логируем и контролируем размер исходника
         file_size_mb = input_path.stat().st_size / (1024 * 1024)
         logger.info(f"Размер файла {input_name}: {file_size_mb:.1f} МБ")
 
-        # Если файл слишком большой - предупреждаем и отказываемся
-        if file_size_mb > 100:  # Больше 100 МБ
+        # Ваши лимиты и сообщения — как в исходном коде
+        if file_size_mb > 100:
             await message.answer(
-                f"❌ Файл {input_name} слишком большой ({file_size_mb:.1f} МБ). Максимальный размер для обработки: 100 МБ.")
+                f"❌ Файл {input_name} слишком большой ({file_size_mb:.1f} МБ). Максимальный размер для обработки: 100 МБ."
+            )
             return
 
         await message.answer("🔄 Идёт сжатие и отправка видео, пожалуйста, подождите…")
-
-        if file_size_mb > 30:  # Для больших файлов (>30 МБ)
+        if file_size_mb > 30:
             await message.answer(
-                f"📁 Обрабатывается большой файл ({file_size_mb:.1f} МБ), это может занять до 2-3 минут...")
+                f"📁 Обрабатывается большой файл ({file_size_mb:.1f} МБ), это может занять до 2-3 минут..."
+            )
 
-        # Быстрые настройки сжатия для разных размеров
-        if "Комус" in input_name or file_size_mb > 50:
-            # Для Комус и больших файлов - быстрое агрессивное сжатие
-            ffmpeg_command = [
-                "ffmpeg", "-y",
-                "-i", str(input_path),
+        # 2) Подбор пресета/параметров — сохранён функционал из текущей версии
+        if ("Комус" in input_name) or (file_size_mb > 50):
+            # Быстрое/агрессивное сжатие + faststart
+            video_args = [
                 "-vcodec", "libx264",
-                "-preset", "ultrafast",  # Самый быстрый пресет
-                "-crf", "30",  # Более агрессивное сжатие
-                "-vf", "scale=1280:720",  # Уменьшаем до 720p
-                "-acodec", "aac", "-b:a", "64k",  # Низкий битрейт аудио
-                "-movflags", "+faststart",  # Быстрый старт
-                str(output_path)
+                "-preset", "ultrafast",
+                "-crf", "30",
+                "-vf", "scale=1280:720",
+                "-acodec", "aac", "-b:a", "64k",
+                "-movflags", "+faststart",
             ]
             logger.info(f"Применяем быстрое сжатие для {input_name}")
-        elif file_size_mb > 20:  # Средние файлы
-            ffmpeg_command = [
-                "ffmpeg", "-y",
-                "-i", str(input_path),
+        elif file_size_mb > 20:
+            video_args = [
                 "-vcodec", "libx264",
                 "-preset", "fast",
                 "-crf", "28",
                 "-acodec", "aac", "-b:a", "96k",
-                str(output_path)
             ]
-        else:  # Маленькие файлы
-            ffmpeg_command = [
-                "ffmpeg", "-y",
-                "-i", str(input_path),
+        else:
+            video_args = [
                 "-vcodec", "libx264",
                 "-preset", "medium",
                 "-crf", "26",
                 "-acodec", "aac", "-b:a", "96k",
-                str(output_path)
             ]
 
-        result = subprocess.run(ffmpeg_command)
+        # 3) Команда ffmpeg с подробной диагностикой ошибок (-loglevel error) и без чтения stdin
+        ffmpeg_command = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-y",
+            "-i", str(input_path),
+            *video_args,
+            str(output_path),
+        ]
+        logger.info(f"FFmpeg cmd: {ffmpeg_command!r}")
+
+        # 4) Принудительно включаем UTF-8 локаль для подпроцесса (устойчивость к Unicode в путях)
+        env = os.environ.copy()
+        env.setdefault("LANG", "C.UTF-8")
+        env.setdefault("LC_CTYPE", "C.UTF-8")
+
+        # 5) Запуск и захват stderr/stdout для понятных сообщений пользователю и в логах
+        result = subprocess.run(
+            ffmpeg_command,
+            capture_output=True,  # stdout и stderr будут в result.stdout/result.stderr
+            text=True,            # декодировать байты в str согласно локали
+            env=env,
+        )
 
         if result.returncode != 0:
-            logger.error(f"Ошибка ffmpeg для файла: {input_name}")
-            await message.answer(f"❌ Ошибка при сжатии видео: {input_name}")
+            # Отчёт со stderr: сразу видно причину сбоя кодека/файла/прав и пр.
+            logger.error(f"ffmpeg failed rc={result.returncode}\nstderr:\n{result.stderr}")
+            # В ответ пользователю не льём весь stderr без лимита, чтобы не утыкаться в ограничения Telegram
+            trimmed_err = (result.stderr or "unknown error").strip()
+            if len(trimmed_err) > 1800:
+                trimmed_err = trimmed_err[:1800] + "…"
+            await message.answer(f"❌ Ошибка при сжатии видео:\n{trimmed_err}")
             return
 
+        # 6) Проверяем, что выход действительно появился
         if not output_path.exists():
-            await message.answer(f"❌ Не удалось создать сжатый файл: {output_name}")
+            logger.error(f"No output created: {repr(str(output_path))}\nstderr:\n{result.stderr}")
+            await message.answer("❌ Не удалось создать сжатый файл.")
             return
 
-        # Проверяем размер сжатого файла
+        # 7) Логика контроля финального размера — сохранена из вашей версии
         compressed_size_mb = output_path.stat().st_size / (1024 * 1024)
         logger.info(f"Сжатый файл: {compressed_size_mb:.1f} МБ")
 
-        # Telegram имеет лимит 50 МБ для видео
         if compressed_size_mb > 50:
             await message.answer(
-                f"❌ Сжатый файл всё ещё слишком большой ({compressed_size_mb:.1f} МБ). Попробуйте использовать файл меньшего размера.")
+                f"❌ Сжатый файл всё ещё слишком большой ({compressed_size_mb:.1f} МБ). Попробуйте использовать файл меньшего размера."
+            )
             return
 
-        # Отправляем как видео
+        # 8) Отправляем видео
         with open(output_path, "rb") as f:
             await message.answer_video(
-                BufferedInputFile(f.read(), filename=output_name),
-                caption=caption or "Видеоинструкция"
+                BufferedInputFile(f.read(), filename=output_path.name),
+                caption=caption or "Видеоинструкция",
             )
 
         logger.info(
-            f"Видео {input_name} успешно отправлено (было: {file_size_mb:.1f} МБ, стало: {compressed_size_mb:.1f} МБ)")
+            f"Видео {input_name} успешно отправлено (было: {file_size_mb:.1f} МБ, стало: {compressed_size_mb:.1f} МБ)"
+        )
 
     except FileNotFoundError:
-        logger.error(f"Файл не найден: {input_path}")
+        logger.error(f"Файл не найден: {input_path!r}")
         await message.answer(f"❌ Файл не найден: {input_name}")
     except Exception as e:
-        logger.error(f"Неожиданная ошибка при отправке видео {input_name}: {e}")
+        # В лог кладём stderr, если успели запустить ffmpeg
+        err_tail = ""
+        if "result" in locals():
+            err_tail = f"\nffmpeg stderr (tail):\n{(result.stderr or '')[-1000:]}"
+        logger.error(f"Неожиданная ошибка при отправке видео {input_name}: {e}{err_tail}")
         await message.answer(f"❌ Произошла ошибка при отправке видео: {str(e)}")
     finally:
-        # Удаляем временный файл
         try:
             if output_path.exists():
                 output_path.unlink()
         except OSError as e:
-            logger.warning(f"Не удалось удалить временный файл {output_name}: {e}")
+            logger.warning(f"Не удалось удалить временный файл {output_path.name}: {e}")
+
 
 
 # Функция проверки доступа
