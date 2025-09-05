@@ -4,16 +4,21 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, InputMediaPhoto
+from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaDocument
 import logging
 import sqlite3
 import datetime
+import subprocess, os
 from datetime import timedelta
 import asyncio
 from zoneinfo import ZoneInfo
 import sys
 from pathlib import Path
 
+BASE_DIR = Path(__file__).parent  # папка, где лежит main.py
+VIDEO_DIR = BASE_DIR
+FFMPEG_PATH = BASE_DIR
+VIDEO_EXTS = ["*.mp4","*.MP4"]
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -126,6 +131,110 @@ class Form(StatesGroup):
     in_calendar = State()
 
 
+async def send_compressed_video(message: types.Message, input_name: str, caption: str = None):
+    input_path = VIDEO_DIR / input_name
+    output_name = f"compressed_{input_name}"
+    output_path = VIDEO_DIR / output_name
+
+    try:
+        # Проверяем размер исходного файла
+        file_size_mb = input_path.stat().st_size / (1024 * 1024)
+        logger.info(f"Размер файла {input_name}: {file_size_mb:.1f} МБ")
+
+        # Если файл слишком большой - предупреждаем и отказываемся
+        if file_size_mb > 100:  # Больше 100 МБ
+            await message.answer(
+                f"❌ Файл {input_name} слишком большой ({file_size_mb:.1f} МБ). Максимальный размер для обработки: 100 МБ.")
+            return
+
+        await message.answer("🔄 Идёт сжатие и отправка видео, пожалуйста, подождите…")
+
+        if file_size_mb > 30:  # Для больших файлов (>30 МБ)
+            await message.answer(
+                f"📁 Обрабатывается большой файл ({file_size_mb:.1f} МБ), это может занять до 2-3 минут...")
+
+        # Быстрые настройки сжатия для разных размеров
+        if "Комус" in input_name or file_size_mb > 50:
+            # Для Комус и больших файлов - быстрое агрессивное сжатие
+            ffmpeg_command = [
+                "ffmpeg", "-y",
+                "-i", str(input_path),
+                "-vcodec", "libx264",
+                "-preset", "ultrafast",  # Самый быстрый пресет
+                "-crf", "30",  # Более агрессивное сжатие
+                "-vf", "scale=1280:720",  # Уменьшаем до 720p
+                "-acodec", "aac", "-b:a", "64k",  # Низкий битрейт аудио
+                "-movflags", "+faststart",  # Быстрый старт
+                str(output_path)
+            ]
+            logger.info(f"Применяем быстрое сжатие для {input_name}")
+        elif file_size_mb > 20:  # Средние файлы
+            ffmpeg_command = [
+                "ffmpeg", "-y",
+                "-i", str(input_path),
+                "-vcodec", "libx264",
+                "-preset", "fast",
+                "-crf", "28",
+                "-acodec", "aac", "-b:a", "96k",
+                str(output_path)
+            ]
+        else:  # Маленькие файлы
+            ffmpeg_command = [
+                "ffmpeg", "-y",
+                "-i", str(input_path),
+                "-vcodec", "libx264",
+                "-preset", "medium",
+                "-crf", "26",
+                "-acodec", "aac", "-b:a", "96k",
+                str(output_path)
+            ]
+
+        result = subprocess.run(ffmpeg_command)
+
+        if result.returncode != 0:
+            logger.error(f"Ошибка ffmpeg для файла: {input_name}")
+            await message.answer(f"❌ Ошибка при сжатии видео: {input_name}")
+            return
+
+        if not output_path.exists():
+            await message.answer(f"❌ Не удалось создать сжатый файл: {output_name}")
+            return
+
+        # Проверяем размер сжатого файла
+        compressed_size_mb = output_path.stat().st_size / (1024 * 1024)
+        logger.info(f"Сжатый файл: {compressed_size_mb:.1f} МБ")
+
+        # Telegram имеет лимит 50 МБ для видео
+        if compressed_size_mb > 50:
+            await message.answer(
+                f"❌ Сжатый файл всё ещё слишком большой ({compressed_size_mb:.1f} МБ). Попробуйте использовать файл меньшего размера.")
+            return
+
+        # Отправляем как видео
+        with open(output_path, "rb") as f:
+            await message.answer_video(
+                BufferedInputFile(f.read(), filename=output_name),
+                caption=caption or "Видеоинструкция"
+            )
+
+        logger.info(
+            f"Видео {input_name} успешно отправлено (было: {file_size_mb:.1f} МБ, стало: {compressed_size_mb:.1f} МБ)")
+
+    except FileNotFoundError:
+        logger.error(f"Файл не найден: {input_path}")
+        await message.answer(f"❌ Файл не найден: {input_name}")
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при отправке видео {input_name}: {e}")
+        await message.answer(f"❌ Произошла ошибка при отправке видео: {str(e)}")
+    finally:
+        # Удаляем временный файл
+        try:
+            if output_path.exists():
+                output_path.unlink()
+        except OSError as e:
+            logger.warning(f"Не удалось удалить временный файл {output_name}: {e}")
+
+
 # Функция проверки доступа
 async def check_access(username: str) -> bool:
     if username in ALLOWED_USERS:
@@ -199,7 +308,7 @@ def get_main_menu(username: str = None):
     # Основные кнопки для всех пользователей
     base_buttons = [
         "Инструкции", "Обучение инструкторов",
-        "Документы"
+        "Справочник"
     ]
 
     # Если пользователь администратор - добавляем кнопку календаря вместо отдельных кнопок событий
@@ -207,6 +316,14 @@ def get_main_menu(username: str = None):
         base_buttons.append("Календарь")  # Заменяем три кнопки на одну
 
     return build_keyboard(base_buttons, 3)
+
+def get_handbook_menu():
+    return build_keyboard([
+        "Контакты ПМ", "ИНН",
+        "Бланки возврата", "Карточки организаций",
+        "Вернуться к меню"
+    ], 2)
+
 
 # Добавим новую функцию для меню календаря
 def get_calendar_menu():
@@ -223,9 +340,11 @@ def get_cancel_keyboard():
 
 def get_instructions_menu():
     return build_keyboard([
-        "Как именовать отчёты", "График и зп табель",
+        "Как именовать отчёты",
+        "График и зп табель",
         "Инспекция ИСС",
-        "Наличные", "Инвентаризация",  # Добавлена новая кнопка
+        "Наличные",
+        "Инвентаризация",  # Добавлена новая кнопка
         "Вернуться к меню"
     ], 2)
 
@@ -233,7 +352,15 @@ def get_inventory_menu():
     return build_keyboard([
         "Алгоритм", "Как проводить?",
         "Закрывашки", "Частые вопросы",
+        "Как оформить заказ (видеоинструкции)",
         "Вернуться к инструкциям"
+    ], 2)
+
+def get_order_video_menu():
+    return build_keyboard([
+        "Леруа", "Комус",
+        "Всеинструменты",
+        "Назад к инвентаризации"
     ], 2)
 
 def get_cash_menu():
@@ -819,12 +946,12 @@ async def process_training(message: types.Message, state: FSMContext, **kwargs):
         await message.answer(response)
 
 
-@dp.message(lambda message: message.text == "Документы")
+@dp.message(lambda message: message.text == "Справочник")
 @access_check
-async def select_document_park(message: types.Message, state: FSMContext, **kwargs):
-    await state.set_state(Form.waiting_for_park)
-    await state.update_data(section="Документы")
-    await message.answer("📂 Выберите парк для получения документов:", reply_markup=get_parks_menu())
+async def select_handbook(message: types.Message, state: FSMContext, **kwargs):
+    await state.set_state(Form.in_section)
+    await state.update_data(current_section="Справочник")
+    await message.answer("📚 Выберите раздел:", reply_markup=get_handbook_menu())
 
 
 
@@ -834,12 +961,158 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
     data = await state.get_data()
     current_section = data.get("current_section")
 
+    if message.text == "Вернуться к меню":
+        await state.clear()
+        username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
+        await message.answer("👋 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
+        return
+
+    # Новый раздел: Справочник
+    if current_section == "Справочник":
+        if message.text == "Контакты ПМ":
+            text = (
+                "Парк-менеджеры:\n\n"
+                "Кошкино\n"
+                "СДЕК: Областная ул., 1\n"
+                "Астратов Роман Юрьевич\n"
+                "+79218621492\n"
+                "[@astratov_roman](https://t.me/astratov_roman)\n\n"
+                "Тюмень\n"
+                "СДЕК: Андрея Кореневского 11\n"
+                "Охрямкина Анастасия Вадимовна \n"
+                "89504873768\n"
+                "[@vaditmn](https://t.me/vaditmn)\n\n"
+                "Нижний\n"
+                "СДЕК: Нижегородская обл., г.Бор, ул. Маяковского, 1А\n"
+                "Арсиев Эрнест Александрович\n"
+                "+79867277470\n"
+                "[@milkenxxx](https://t.me/milkenxxx)\n\n"
+                "Уктус\n"
+                "СДЕК: Щербакова 35\n"
+                "Михайлова Эвелина Сергеевна\n"
+                "+79920208237\n"
+                "[@loreley1264](https://t.me/loreley1264)\n\n"
+                "Дубрава\n"
+                "СДЕК: Щербакова 35\n"
+                "Бурлакова Ольга Григорьевна \n"
+                "+79193727914\n"
+                "[@olikburlakova](https://t.me/olikburlakova)"
+            )
+            await message.answer(text, parse_mode="Markdown", reply_markup=get_handbook_menu())
+            return
+
+        if message.text == "ИНН":
+            text = (
+                "ИНН:\n\n"
+                "Зеленый треугольник: 7839504361\n"
+                "ПК7 Екатеринбург: 7839102736\n"
+                "ПК7 Нижний: 5246056919\n"
+                "ПК7 Тюмень: 7838115620\n"
+                "Дубрава-парк: 6670343533"
+            )
+            await message.answer(text, reply_markup=get_handbook_menu())
+            return
+
+        if message.text == "Бланки возврата":
+            # Отправка всех PDF одним сообщением медиагруппой, либо последовательно
+            files = [
+                "Бланк для возврата Кошкино.pdf",
+                "Бланк для возврата Екатеринбург.pdf",
+                "Бланк для возврата НН.pdf",
+                "Бланк для возврата Тюмень.pdf",
+                "Бланк для возврата Дубрава.pdf",
+            ]
+            # Вариант 1: несколько сообщений по одному документу:
+            for fpath in files:
+                try:
+                    with open(fpath, "rb") as f:
+                        await message.answer_document(
+                            BufferedInputFile(f.read(), filename=fpath)
+                        )
+                        await asyncio.sleep(0.2)
+                except FileNotFoundError:
+                    await message.answer(f"❌ Файл не найден: {fpath}")
+            await message.answer("Бланки возврата для каждого парка.", reply_markup=get_handbook_menu())
+            return
+
+        if message.text == "Карточки организаций":
+            files = [
+                "Карточка ООО Зеленый Треуголник.pdf",
+                "Карточка ООО ПК7 Екатеринбург.pdf",
+                "Карточка ООО ПК7 Нижний.pdf",
+                "Карточка ООО ПК7 Тюмень.pdf",
+                "Карточка ООО Дубрава-Парк.pdf",
+            ]
+
+            # Отправляем каждый файл отдельным сообщением
+            for fpath in files:
+                try:
+                    with open(fpath, "rb") as f:
+                        await message.answer_document(
+                            BufferedInputFile(f.read(), filename=fpath)
+                        )
+                    await asyncio.sleep(0.2)
+                except FileNotFoundError:
+                    await message.answer(f"❌ Файл не найден: {fpath}")
+
+            await message.answer("Карточки организаций для каждого парка.", reply_markup=get_handbook_menu())
+            return
+
+        await message.answer("📚 Используйте кнопки для навигации", reply_markup=get_handbook_menu())
+        return
+
     if message.text == "Вернуться к инструкциям":
         await state.set_state(Form.in_instructions)
         await message.answer("📋 Выбери инструкцию:", reply_markup=get_instructions_menu())
         return
 
     if current_section == "Инвентаризация":
+        # Обработка видеоинструкций - ВЫНЕСЕНО ИЗ TRY БЛОКА
+        if data.get("subsection") == "order_videos":
+            if message.text == "Назад к инвентаризации":
+                await state.update_data(subsection=None)
+                await message.answer("📦 Инвентаризация:", reply_markup=get_inventory_menu())
+                return
+
+            # Словарь соответствий кнопок и файлов
+            video_files_map = {
+                "Леруа": "Леруа Как оформить заказ.mp4",
+                "Комус": "Комус Как оформить заказ.mp4",
+                "Всеинструменты": "Всеинстурменты Как оформить заказ.mp4"
+                # Обратите внимание на опечатку в названии файла
+            }
+
+            button_text = message.text.strip()
+
+            if button_text not in video_files_map:
+                await message.answer(f"❌ Неизвестный поставщик: {button_text}")
+                await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
+                return
+
+            video_filename = video_files_map[button_text]
+            video_path = VIDEO_DIR / video_filename
+
+            if not video_path.exists():
+                logger.error(f"Видеофайл не найден: {video_path}")
+                await message.answer(f"❌ Видеофайл не найден: {video_filename}")
+                await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
+                return
+
+            try:
+                await send_compressed_video(
+                    message,
+                    input_name=video_filename,
+                    caption=f"Видеоинструкция: Как оформить заказ в {button_text}"
+                )
+                await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
+            except Exception as e:
+                logger.error(f"Ошибка при отправке видео {video_filename}: {e}")
+                await message.answer(f"❌ Произошла ошибка при отправке видео для {button_text}")
+                await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
+
+            return
+
+        # Остальные кнопки инвентаризации - В TRY БЛОКЕ
         try:
             if message.text == "Алгоритм":
                 with open("инвент алгоритм.jpg", "rb") as photo:
@@ -853,12 +1126,10 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                     "инвент как проводить 2.jpg",
                     "инвент как проводить 3.jpg"
                 ]
-
                 for file in files:
                     with open(file, "rb") as photo:
                         await message.answer_photo(BufferedInputFile(photo.read(), filename=file))
                     await asyncio.sleep(0.5)  # Задержка между сообщениями
-
                 await message.answer("Выберите следующий раздел:", reply_markup=get_inventory_menu())
 
             elif message.text == "Закрывашки":
@@ -877,22 +1148,28 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                     "• Если > 5000р. - оформляй по безналу или согласуй с опер.диром\n\n"
                     "🔹 МНЕ СРОЧНО\n"
                     "• Если счёт требует срочной оплаты не в день инвентаризации:\n"
-                    "  Оформляй и отправляй в беседу со словом 'СРОЧНО'\n\n"
+                    " Оформляй и отправляй в беседу со словом 'СРОЧНО'\n\n"
                     "🔹 OZON\n"
                     "• Заказы с Ozon нежелательны (проблемы с документами у бухгалтерии)\n"
                     "• Допустимы только редкие заказы, в основном заказываем у основных поставщиков\n\n"
                     "🔹 Нам доставили гайковерт, но он не подходит. Что делать?\n"
                     "• Если заказали неподходящий товар по безналу:\n"
-                    "  1. Сообщи офис-менеджеру\n"
-                    "  2. Оформи доверенность на возврат\n"
-                    "  3. Верни товар в магазин с доверенностью"
+                    " 1. Сообщи офис-менеджеру\n"
+                    " 2. Оформи доверенность на возврат\n"
+                    " 3. Верни товар в магазин с доверенностью"
                 )
                 await message.answer(faq_text)
                 await message.answer("Выберите следующий раздел:", reply_markup=get_inventory_menu())
 
+            elif message.text == "Как оформить заказ (видеоинструкции)":
+                await state.update_data(subsection="order_videos")
+                await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
+
         except FileNotFoundError as e:
             await message.answer(f"❌ Файл не найден: {e}")
             logger.error(f"File not found: {e}")
+
+
 
     if current_section == "Наличные":
         try:
@@ -999,75 +1276,6 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
     elif "Вернуться к меню" in message.text:
         await state.clear()
         await cmd_start(message, state)
-
-
-@dp.message(Form.waiting_for_park)
-@access_check
-async def process_park(message: types.Message, state: FSMContext, **kwargs):
-    if message.text == "Назад":
-        await state.clear()
-        await cmd_start(message, state)
-        return
-
-    data = await state.get_data()
-    park = message.text
-    section = data.get("section")
-
-    # Обработка раздела "Документы"
-    if section == "Документы":
-        # Маппинг названий парков к именам файлов
-        park_file_mapping = {
-            "Дубрава": "Дубрава",
-            "Уктус": "Екатеринбург",
-            "Кошкино": "Кошкино",
-            "Нижний": "НН",
-            "Тюмень": "Тюмень"
-        }
-
-        if park in park_file_mapping:
-            file_prefix = park_file_mapping[park]
-
-            try:
-                # Отправляем бланк для возврата для конкретного парка
-                return_form_file = f"Бланк для возврата {file_prefix}.pdf"
-                with open(return_form_file, "rb") as file:
-                    await message.answer_document(
-                        BufferedInputFile(
-                            file.read(),
-                            filename=return_form_file
-                        ),
-                        caption=f"📄 Бланк для возврата - {park}"
-                    )
-
-                # Отправляем общий справочник
-                with open("Справочник.pdf", "rb") as file:
-                    await message.answer_document(
-                        BufferedInputFile(
-                            file.read(),
-                            filename="Справочник.pdf"
-                        ),
-                        caption="📚 Общий справочник"
-                    )
-
-                # Возвращаем в главное меню
-                await state.clear()
-                username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
-                await message.answer("Документы отправлены. Выберите действие:", reply_markup=get_main_menu(username))
-
-            except FileNotFoundError as e:
-                logger.error(f"Файл не найден: {e}")
-                await message.answer("❌ Файл документа не найден. Обратитесь к администратору.")
-                await state.clear()
-                await cmd_start(message, state)
-        else:
-            await message.answer("❌ Неверный выбор парка. Попробуйте еще раз.")
-    else:
-        # Обработка других разделов (если есть)
-        await state.set_state(Form.in_section)
-        await state.update_data(current_park=park)
-        await message.answer(f"Выбран парк {park} для раздела {section}")
-
-
 
 
 
