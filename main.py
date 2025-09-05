@@ -8,6 +8,7 @@ from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaDocument
 import logging
 import sqlite3
 import datetime
+from shutil import which
 import subprocess, os
 from datetime import timedelta
 import asyncio
@@ -20,6 +21,7 @@ VIDEO_DIR = BASE_DIR
 FFMPEG_PATH = BASE_DIR
 VIDEO_EXTS = ["*.mp4","*.MP4"]
 
+
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,6 +33,27 @@ dp = Dispatcher()
 # Часовые пояса
 MSK_TZ = ZoneInfo("Europe/Moscow")
 UTC_TZ = ZoneInfo("UTC")
+
+def resolve_ffmpeg_bin() -> str | None:
+    # 1) приоритет переменной окружения
+    env_bin = os.environ.get("FFMPEG_BIN")
+    if env_bin and Path(env_bin).exists() and os.access(env_bin, os.X_OK):
+        return env_bin
+
+    # 2) поиск в PATH (Linux/Windows)
+    for name in ("ffmpeg", "ffmpeg.exe"):
+        found = which(name)
+        if found and os.access(found, os.X_OK):
+            return found
+
+    # 3) типичные абсолютные пути для Ubuntu/Unix
+    for cand in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if Path(cand).exists() and os.access(cand, os.X_OK):
+            return cand
+
+    return None
+
+FFMPEG_BIN = resolve_ffmpeg_bin()
 
 # Список разрешенных пользователей
 ALLOWED_USERS = {
@@ -188,15 +211,21 @@ async def send_compressed_video(message: types.Message, input_name: str, caption
             ]
 
         # 3) Команда ffmpeg с подробной диагностикой ошибок (-loglevel error) и без чтения stdin
+        ffmpeg_bin = FFMPEG_BIN
+        if not ffmpeg_bin:
+            logger.error("ffmpeg не найден: проверьте установку и PATH")
+            await message.answer(
+                "❌ ffmpeg не найден на сервере. Установите ffmpeg или задайте FFMPEG_BIN=/usr/bin/ffmpeg.")
+            return
+
         ffmpeg_command = [
-            "ffmpeg",
+            ffmpeg_bin,
             "-hide_banner", "-loglevel", "error", "-nostdin",
             "-y",
             "-i", str(input_path),
             *video_args,
             str(output_path),
         ]
-        logger.info(f"FFmpeg cmd: {ffmpeg_command!r}")
 
         # 4) Принудительно включаем UTF-8 локаль для подпроцесса (устойчивость к Unicode в путях)
         env = os.environ.copy()
