@@ -12,6 +12,7 @@ from shutil import which
 import subprocess, os
 from datetime import timedelta
 import asyncio
+from asyncio.subprocess import PIPE
 from zoneinfo import ZoneInfo
 import sys
 from pathlib import Path
@@ -19,8 +20,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent  # папка, где лежит main.py
 VIDEO_DIR = BASE_DIR
 FFMPEG_PATH = BASE_DIR
-VIDEO_EXTS = ["*.mp4","*.MP4"]
-
+VIDEO_EXTS = ["*.mp4", "*.MP4"]
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -34,24 +34,27 @@ dp = Dispatcher()
 MSK_TZ = ZoneInfo("Europe/Moscow")
 UTC_TZ = ZoneInfo("UTC")
 
+# Глобальные структуры для контроля видео задач
+VIDEO_TASKS: dict[int, asyncio.Task] = {}
+FFMPEG_PROCS: dict[int, asyncio.subprocess.Process] = {}
+
+
 def resolve_ffmpeg_bin() -> str | None:
     # 1) приоритет переменной окружения
     env_bin = os.environ.get("FFMPEG_BIN")
     if env_bin and Path(env_bin).exists() and os.access(env_bin, os.X_OK):
         return env_bin
-
     # 2) поиск в PATH (Linux/Windows)
     for name in ("ffmpeg", "ffmpeg.exe"):
         found = which(name)
         if found and os.access(found, os.X_OK):
             return found
-
     # 3) типичные абсолютные пути для Ubuntu/Unix
     for cand in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
         if Path(cand).exists() and os.access(cand, os.X_OK):
             return cand
-
     return None
+
 
 FFMPEG_BIN = resolve_ffmpeg_bin()
 
@@ -64,15 +67,17 @@ ALLOWED_USERS = {
     "@vaditmn",
     "@olikburlakova",
     "@milkenxxx",
-    "@astratov_roman"
-
+    "@astratov_roman",
+    "@Fidel_spb"
 }
 
-ADMIN_USERS = {"@burgerking312","@veron144ka",  "@DashaRyzhova"}
+ADMIN_USERS = {"@burgerking312", "@veron144ka", "@DashaRyzhova","@Fidel_spb"}
+
 
 # Функция проверки админских прав
 async def check_admin(username: str) -> bool:
     return username in ADMIN_USERS
+
 
 # Фоновая задача для очистки старых событий
 async def clean_old_events_task():
@@ -89,11 +94,9 @@ def get_allowed_users_chat_ids():
     """Получаем chat_id всех разрешенных пользователей из базы данных"""
     conn = sqlite3.connect('events.db')
     c = conn.cursor()
-
     # Создаем плейсхолдеры для IN-условия
     placeholders = ','.join(['?'] * len(ALLOWED_USERS))
     query = f"SELECT DISTINCT chat_id FROM users WHERE username IN ({placeholders})"
-
     c.execute(query, list(ALLOWED_USERS))
     chat_ids = [row[0] for row in c.fetchall()]
     conn.close()
@@ -104,31 +107,27 @@ def get_allowed_users_chat_ids():
 def init_db():
     conn = sqlite3.connect('events.db')
     c = conn.cursor()
-
     # Создаем таблицу событий с проверкой существующих колонок
     c.execute('''CREATE TABLE IF NOT EXISTS events
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 park TEXT NOT NULL,
-                 event_date TEXT NOT NULL,
-                 event_text TEXT NOT NULL,
-                 remind_before INTEGER NOT NULL,
-                 user_id TEXT NOT NULL,
-                 chat_id INTEGER NOT NULL,
-                 reminded INTEGER DEFAULT 0)''')
-
+                  park TEXT NOT NULL,
+                  event_date TEXT NOT NULL,
+                  event_text TEXT NOT NULL,
+                  remind_before INTEGER NOT NULL,
+                  user_id TEXT NOT NULL,
+                  chat_id INTEGER NOT NULL,
+                  reminded INTEGER DEFAULT 0)''')
     # Проверяем наличие колонки comment
     c.execute("PRAGMA table_info(events)")
     columns = [column[1] for column in c.fetchall()]
     if 'comment' not in columns:
         c.execute("ALTER TABLE events ADD COLUMN comment TEXT")
         logger.info("Добавлен новый столбец 'comment' в таблицу events")
-
     # Таблица пользователей
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 username TEXT NOT NULL UNIQUE,
-                 chat_id INTEGER NOT NULL)''')
-
+                  username TEXT NOT NULL UNIQUE,
+                  chat_id INTEGER NOT NULL)''')
     conn.commit()
     conn.close()
 
@@ -152,15 +151,18 @@ class Form(StatesGroup):
     in_instructions = State()  # Новое состояние для раздела инструкций
     in_training = State()  # Новое состояние для обучения
     in_calendar = State()
+    # НОВОЕ: состояние для блокировки навигации во время обработки видео
+    processing_video = State()
 
 
-async def send_compressed_video(message: types.Message, input_name: str, caption: str = None):
-    # Абсолютные пути и базовая валидация
+# Асинхронная функция сжатия и отправки видео с поддержкой отмены
+async def compress_and_send_video_async(message: types.Message, input_name: str, caption: str = None,
+                                        timeout_sec: int = 600):
     input_path = (VIDEO_DIR / input_name).resolve()
     output_path = (VIDEO_DIR / f"compressed_{input_name}").resolve()
 
     try:
-        # 0) Проверяем наличие входного файла (ранний выход с понятным сообщением)
+        # 0) Проверяем наличие входного файла
         if not input_path.exists():
             logger.error(f"Input missing: {repr(str(input_path))}")
             await message.answer(f"❌ Файл не найден: {input_name}")
@@ -170,22 +172,17 @@ async def send_compressed_video(message: types.Message, input_name: str, caption
         file_size_mb = input_path.stat().st_size / (1024 * 1024)
         logger.info(f"Размер файла {input_name}: {file_size_mb:.1f} МБ")
 
-        # Ваши лимиты и сообщения — как в исходном коде
         if file_size_mb > 100:
             await message.answer(
-                f"❌ Файл {input_name} слишком большой ({file_size_mb:.1f} МБ). Максимальный размер для обработки: 100 МБ."
-            )
+                f"❌ Файл {input_name} слишком большой ({file_size_mb:.1f} МБ). Максимальный размер для обработки: 100 МБ.")
             return
 
-        await message.answer("🔄 Идёт сжатие и отправка видео, пожалуйста, подождите…")
         if file_size_mb > 30:
             await message.answer(
-                f"📁 Обрабатывается большой файл ({file_size_mb:.1f} МБ), это может занять до 2-3 минут..."
-            )
+                f"📁 Обрабатывается большой файл ({file_size_mb:.1f} МБ), это может занять до 2-3 минут...")
 
-        # 2) Подбор пресета/параметров — сохранён функционал из текущей версии
+        # 2) Подбор пресета/параметров
         if ("Комус" in input_name) or (file_size_mb > 50):
-            # Быстрое/агрессивное сжатие + faststart
             video_args = [
                 "-vcodec", "libx264",
                 "-preset", "ultrafast",
@@ -210,7 +207,7 @@ async def send_compressed_video(message: types.Message, input_name: str, caption
                 "-acodec", "aac", "-b:a", "96k",
             ]
 
-        # 3) Команда ffmpeg с подробной диагностикой ошибок (-loglevel error) и без чтения stdin
+        # 3) Команда ffmpeg
         ffmpeg_bin = FFMPEG_BIN
         if not ffmpeg_bin:
             logger.error("ffmpeg не найден: проверьте установку и PATH")
@@ -218,7 +215,11 @@ async def send_compressed_video(message: types.Message, input_name: str, caption
                 "❌ ffmpeg не найден на сервере. Установите ffmpeg или задайте FFMPEG_BIN=/usr/bin/ffmpeg.")
             return
 
-        ffmpeg_command = [
+        env = os.environ.copy()
+        env.setdefault("LANG", "C.UTF-8")
+        env.setdefault("LC_CTYPE", "C.UTF-8")
+
+        cmd = [
             ffmpeg_bin,
             "-hide_banner", "-loglevel", "error", "-nostdin",
             "-y",
@@ -227,46 +228,47 @@ async def send_compressed_video(message: types.Message, input_name: str, caption
             str(output_path),
         ]
 
-        # 4) Принудительно включаем UTF-8 локаль для подпроцесса (устойчивость к Unicode в путях)
-        env = os.environ.copy()
-        env.setdefault("LANG", "C.UTF-8")
-        env.setdefault("LC_CTYPE", "C.UTF-8")
+        # 4) Запускаем как асинхронный подпроцесс
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE, env=env)
+        FFMPEG_PROCS[message.chat.id] = proc
 
-        # 5) Запуск и захват stderr/stdout для понятных сообщений пользователю и в логах
-        result = subprocess.run(
-            ffmpeg_command,
-            capture_output=True,  # stdout и stderr будут в result.stdout/result.stderr
-            text=True,            # декодировать байты в str согласно локали
-            env=env,
-        )
+        try:
+            # Ожидание с тайм-аутом
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+            raise asyncio.TimeoutError("Сжатие превысило лимит времени")
 
-        if result.returncode != 0:
-            # Отчёт со stderr: сразу видно причину сбоя кодека/файла/прав и пр.
-            logger.error(f"ffmpeg failed rc={result.returncode}\nstderr:\n{result.stderr}")
-            # В ответ пользователю не льём весь stderr без лимита, чтобы не утыкаться в ограничения Telegram
-            trimmed_err = (result.stderr or "unknown error").strip()
-            if len(trimmed_err) > 1800:
-                trimmed_err = trimmed_err[:1800] + "…"
+        rc = proc.returncode
+        stderr_text = stderr.decode(errors="replace") if isinstance(stderr, (bytes, bytearray)) else (stderr or "")
+
+        if rc != 0:
+            logger.error(f"ffmpeg failed rc={rc}\nstderr:\n{stderr_text}")
+            trimmed_err = stderr_text[:1800] + "…" if len(stderr_text) > 1800 else stderr_text
             await message.answer(f"❌ Ошибка при сжатии видео:\n{trimmed_err}")
             return
 
-        # 6) Проверяем, что выход действительно появился
+        # 5) Проверяем, что выход появился
         if not output_path.exists():
-            logger.error(f"No output created: {repr(str(output_path))}\nstderr:\n{result.stderr}")
+            logger.error(f"No output created: {repr(str(output_path))}\nstderr:\n{stderr_text}")
             await message.answer("❌ Не удалось создать сжатый файл.")
             return
 
-        # 7) Логика контроля финального размера — сохранена из вашей версии
+        # 6) Логика контроля финального размера
         compressed_size_mb = output_path.stat().st_size / (1024 * 1024)
         logger.info(f"Сжатый файл: {compressed_size_mb:.1f} МБ")
 
         if compressed_size_mb > 50:
             await message.answer(
-                f"❌ Сжатый файл всё ещё слишком большой ({compressed_size_mb:.1f} МБ). Попробуйте использовать файл меньшего размера."
-            )
+                f"❌ Сжатый файл всё ещё слишком большой ({compressed_size_mb:.1f} МБ). Попробуйте использовать файл меньшего размера.")
             return
 
-        # 8) Отправляем видео
+        # 7) Отправляем видео
         with open(output_path, "rb") as f:
             await message.answer_video(
                 BufferedInputFile(f.read(), filename=output_path.name),
@@ -274,26 +276,82 @@ async def send_compressed_video(message: types.Message, input_name: str, caption
             )
 
         logger.info(
-            f"Видео {input_name} успешно отправлено (было: {file_size_mb:.1f} МБ, стало: {compressed_size_mb:.1f} МБ)"
-        )
+            f"Видео {input_name} успешно отправлено (было: {file_size_mb:.1f} МБ, стало: {compressed_size_mb:.1f} МБ)")
 
     except FileNotFoundError:
         logger.error(f"Файл не найден: {input_path!r}")
         await message.answer(f"❌ Файл не найден: {input_name}")
     except Exception as e:
-        # В лог кладём stderr, если успели запустить ffmpeg
-        err_tail = ""
-        if "result" in locals():
-            err_tail = f"\nffmpeg stderr (tail):\n{(result.stderr or '')[-1000:]}"
-        logger.error(f"Неожиданная ошибка при отправке видео {input_name}: {e}{err_tail}")
+        logger.error(f"Неожиданная ошибка при отправке видео {input_name}: {e}")
         await message.answer(f"❌ Произошла ошибка при отправке видео: {str(e)}")
     finally:
+        FFMPEG_PROCS.pop(message.chat.id, None)
         try:
             if output_path.exists():
                 output_path.unlink()
         except OSError as e:
             logger.warning(f"Не удалось удалить временный файл {output_path.name}: {e}")
 
+
+# Функция для запуска обработки видео с блокировкой навигации
+async def start_video_processing(message: types.Message, state: FSMContext, input_name: str, caption: str):
+    # Запоминаем предыдущее состояние И все данные состояния
+    prev_state = await state.get_state()
+    prev_data = await state.get_data()
+    await state.update_data(_prev_state=prev_state, _prev_data=prev_data)
+
+    # Переходим в блокирующее состояние
+    await state.set_state(Form.processing_video)
+    await message.answer(
+        "🔄 Идёт сжатие видео, другие действия временно недоступны.\nНажмите «Отмена загрузки», чтобы прервать операцию.",
+        reply_markup=get_processing_keyboard()
+    )
+
+    # Создаём отменяемую задачу
+    task = asyncio.create_task(compress_and_send_video_async(message, input_name, caption, timeout_sec=600))
+    VIDEO_TASKS[message.chat.id] = task
+
+    try:
+        await task  # Ждём завершения или CancelledError
+        await message.answer("✅ Видео успешно отправлено!")
+    except asyncio.CancelledError:
+        await message.answer("❌ Загрузка отменена.")
+    except Exception as e:
+        logger.error(f"Ошибка в задаче обработки видео: {e}")
+        await message.answer("❌ Произошла ошибка при обработке видео.")
+    finally:
+        VIDEO_TASKS.pop(message.chat.id, None)
+
+        # ИСПРАВЛЕНИЕ: Принудительная очистка временного файла при любом завершении
+        try:
+            output_path = (VIDEO_DIR / f"compressed_{input_name}").resolve()
+            if output_path.exists():
+                output_path.unlink()
+                logger.info(f"Временный файл {output_path.name} удален после завершения/отмены задачи")
+        except Exception as cleanup_error:
+            logger.warning(f"Не удалось удалить временный файл compressed_{input_name}: {cleanup_error}")
+
+        # Возвращаем предыдущее состояние И данные состояния
+        data = await state.get_data()
+        prev_state = data.get("_prev_state")
+        prev_data = data.get("_prev_data", {})
+
+        if prev_state:
+            await state.set_state(prev_state)
+            # Восстанавливаем все данные состояния, кроме служебных
+            for key, value in prev_data.items():
+                if not key.startswith("_prev_"):
+                    await state.update_data({key: value})
+        else:
+            await state.clear()
+
+        # Определяем правильное меню для возврата
+        if prev_data.get("subsection") == "order_videos":
+            # Если были в разделе выбора видео поставщиков - возвращаем туда
+            await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
+        else:
+            # Иначе возвращаем в основной раздел инвентаризации
+            await message.answer("📦 Инвентаризация:", reply_markup=get_inventory_menu())
 
 
 # Функция проверки доступа
@@ -315,6 +373,7 @@ def access_check(func):
 
     return wrapper
 
+
 # Декоратор для проверки админских прав
 def admin_check(func):
     async def wrapper(message: types.Message, *args, **kwargs):
@@ -323,6 +382,7 @@ def admin_check(func):
             await message.answer("⛔ Доступ запрещен. Только администраторы могут добавлять события.")
             return
         return await func(message, *args, **kwargs)
+
     return wrapper
 
 
@@ -341,18 +401,14 @@ def clean_old_events(days=1):
     try:
         conn = sqlite3.connect('events.db')
         c = conn.cursor()
-
         # Удаляем события, которые завершились раньше чем X дней назад
         delete_time_utc = (datetime.datetime.now(UTC_TZ) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-
         # Логируем перед удалением
         c.execute("SELECT COUNT(*) FROM events WHERE event_date < ?", (delete_time_utc,))
         count_before = c.fetchone()[0]
-
         c.execute("DELETE FROM events WHERE event_date < ?", (delete_time_utc,))
         deleted_count = c.rowcount
         conn.commit()
-
         logger.info(f"Удалено {deleted_count}/{count_before} старых событий (старше {days} дней)")
     except Exception as e:
         logger.error(f"Ошибка при удалении старых событий: {e}", exc_info=True)
@@ -371,12 +427,11 @@ def get_main_menu(username: str = None):
         "Инструкции", "Обучение инструкторов",
         "Справочник"
     ]
-
-    # Если пользователь администратор - добавляем кнопку календаря вместо отдельных кнопок событий
+    # Если пользователь администратор - добавляем кнопку календаря
     if username and username in ADMIN_USERS:
-        base_buttons.append("Календарь")  # Заменяем три кнопки на одну
-
+        base_buttons.append("Календарь")
     return build_keyboard(base_buttons, 3)
+
 
 def get_handbook_menu():
     return build_keyboard([
@@ -386,17 +441,20 @@ def get_handbook_menu():
     ], 2)
 
 
-# Добавим новую функцию для меню календаря
 def get_calendar_menu():
     return build_keyboard([
         "Добавить событие", "Мои события",
         "Удалить событие", "Вернуться к меню"
     ], 2)
 
-# Добавим функцию для кнопки отмены
+
 def get_cancel_keyboard():
     return build_keyboard(["Отмена"], 1)
 
+
+# НОВАЯ клавиатура для отмены загрузки
+def get_processing_keyboard():
+    return build_keyboard(["Отмена загрузки"], 1)
 
 
 def get_instructions_menu():
@@ -405,9 +463,10 @@ def get_instructions_menu():
         "График и зп табель",
         "Инспекция ИСС",
         "Наличные",
-        "Инвентаризация",  # Добавлена новая кнопка
+        "Инвентаризация",
         "Вернуться к меню"
     ], 2)
+
 
 def get_inventory_menu():
     return build_keyboard([
@@ -417,6 +476,7 @@ def get_inventory_menu():
         "Вернуться к инструкциям"
     ], 2)
 
+
 def get_order_video_menu():
     return build_keyboard([
         "Леруа", "Комус",
@@ -424,26 +484,25 @@ def get_order_video_menu():
         "Назад к инвентаризации"
     ], 2)
 
+
 def get_cash_menu():
     return build_keyboard([
         "Алгоритм", "Как тратим",
-        "Результат", "Вернуться к инструкциям"  # Изменил название для соответствия фото
+        "Результат", "Вернуться к инструкциям"
     ], 2)
+
 
 def get_instructors_menu():
     return build_keyboard([
         "Чек-лист стажёра",
-        "Когда выводить на полную ставку?",  # Новая кнопка
-        "Документы для оформления",  # Новая кнопка
+        "Когда выводить на полную ставку?",
+        "Документы для оформления",
         "Вернуться к меню"
     ], 2)
 
 
 def get_parks_menu():
     return build_keyboard(["Кошкино", "Уктус", "Дубрава", "Нижний", "Тюмень", "Назад"], 2)
-
-
-
 
 
 def get_schedule_menu():
@@ -464,17 +523,15 @@ def get_inspection_menu():
     ], 2)
 
 
-# Функции для работы с календарем
+# Функции для работы с календарем (без изменений)
 def save_event(event_date, event_text, remind_before, user_id, chat_id, comment=""):
     try:
         # Парсим введенную дату как наивное время (предполагаем MSK)
         naive_dt = datetime.datetime.strptime(event_date, "%d.%m.%Y %H:%M")
         logger.info(f"Введенное время (наивное): {naive_dt}")
-
         # Добавляем MSK TZ
         msk_dt = naive_dt.replace(tzinfo=MSK_TZ)
         logger.info(f"Введенное время (MSK): {msk_dt}")
-
         # Преобразуем в UTC
         utc_dt = msk_dt.astimezone(UTC_TZ)
         event_date_sql = utc_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -515,11 +572,9 @@ def get_user_events(user_id):
     now_utc = datetime.datetime.now(UTC_TZ).strftime("%Y-%m-%d %H:%M:%S")
     c.execute("SELECT * FROM events WHERE user_id=? AND event_date >= ? ORDER BY event_date", (user_id, now_utc))
     events = c.fetchall()
-
     # Логируем структуру события
     if events:
         logger.info(f"Структура события: {len(events[0])} полей")
-
     conn.close()
     return events
 
@@ -527,19 +582,18 @@ def get_user_events(user_id):
 def get_events_to_remind():
     conn = sqlite3.connect('events.db')
     c = conn.cursor()
-
     # Получаем текущее время в UTC
     now_utc = datetime.datetime.now(UTC_TZ).strftime("%Y-%m-%d %H:%M:%S")
     logger.info(f"Текущее время UTC: {now_utc}")
 
     # Запрос в UTC
     query = """
-        SELECT 
-            id, park, event_date, event_text, remind_before, user_id, chat_id, reminded, comment
-        FROM events 
-        WHERE reminded = 0 
-        AND datetime(event_date, '-' || remind_before || ' minutes') <= datetime('now')
-        """
+    SELECT
+        id, park, event_date, event_text, remind_before, user_id, chat_id, reminded, comment
+    FROM events
+    WHERE reminded = 0
+    AND datetime(event_date, '-' || remind_before || ' minutes') <= datetime('now')
+    """
 
     try:
         c.execute(query)
@@ -549,7 +603,6 @@ def get_events_to_remind():
         events = []
 
     logger.info(f"Найдено событий: {len(events)}")
-
     for event in events:
         event_id, park, event_date, event_text, remind_before, user_id, chat_id, reminded, comment = event
         logger.info(f"Событие ID {event_id}: Дата (UTC): {event_date}")
@@ -591,11 +644,12 @@ async def check_reminders():
                 # Конвертируем UTC в MSK для отображения
                 utc_dt = datetime.datetime.strptime(event_date_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC_TZ)
                 msk_dt = utc_dt.astimezone(MSK_TZ)
-                # На следующий код:
+
                 month_names = [
                     "января", "февраля", "марта", "апреля", "мая", "июня",
                     "июля", "августа", "сентября", "октября", "ноября", "декабря"
                 ]
+
                 day = msk_dt.day
                 month = month_names[msk_dt.month - 1]
                 time_str = msk_dt.strftime("%H:%M")
@@ -629,6 +683,39 @@ async def check_reminders():
         await asyncio.sleep(30)
 
 
+# НОВЫЕ обработчики для состояния processing_video (ДОЛЖНЫ БЫТЬ ВЫШЕ ДРУГИХ ОБРАБОТЧИКОВ!)
+@dp.message(Form.processing_video, lambda m: m.text == "Отмена загрузки")
+async def cancel_video_processing(message: types.Message, state: FSMContext):
+    # Прерываем задачу и ffmpeg-процесс
+    task = VIDEO_TASKS.get(message.chat.id)
+    proc = FFMPEG_PROCS.get(message.chat.id)
+
+    if proc and proc.returncode is None:
+        proc.terminate()
+        # Даем время на корректное завершение
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@dp.message(Form.processing_video)
+async def block_inputs_while_processing(message: types.Message):
+    # Блокируем любые другие кнопки/ввод во время обработки
+    await message.answer(
+        "⏳ Видео обрабатывается. Дождитесь завершения или нажмите «Отмена загрузки».",
+        reply_markup=get_processing_keyboard()
+    )
+
+
 # Обработчики команд
 @dp.message(Command("start"))
 @access_check
@@ -639,21 +726,19 @@ async def cmd_start(message: types.Message, state: FSMContext, **kwargs):
 
     conn = sqlite3.connect('events.db')
     c = conn.cursor()
-
     # Создаем таблицу пользователей, если ее нет
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 username TEXT NOT NULL UNIQUE,
-                 chat_id INTEGER NOT NULL)''')
-
+                  username TEXT NOT NULL UNIQUE,
+                  chat_id INTEGER NOT NULL)''')
     # Добавляем/обновляем пользователя
     c.execute("INSERT OR REPLACE INTO users (username, chat_id) VALUES (?, ?)",
               (username, chat_id))
-
     conn.commit()
     conn.close()
 
     await message.answer("👋 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
+
 
 # Обработчик для кнопки "Календарь"
 @dp.message(lambda message: message.text == "Календарь")
@@ -671,6 +756,7 @@ async def handle_start_button(message: types.Message, state: FSMContext, **kwarg
     await message.answer("👋 Добро пожаловать! Выберите действие:",
                          reply_markup=get_main_menu(username))
 
+
 # Обработчики для кнопок в меню календаря
 @dp.message(Form.in_calendar, lambda message: message.text == "Добавить событие")
 @access_check
@@ -679,6 +765,7 @@ async def add_event_start(message: types.Message, state: FSMContext, **kwargs):
     await state.set_state(Form.waiting_for_event_date)
     await message.answer("Введите дату и время события в формате ДД.ММ.ГГГГ ЧЧ:ММ (например, 31.12.2025 15:00):",
                          reply_markup=get_cancel_keyboard())
+
 
 # Обработчики для кнопки "Отмена" - должны быть объявлены ДО обработчиков ввода данных
 @dp.message(Form.waiting_for_event_date, lambda message: message.text == "Отмена")
@@ -691,6 +778,7 @@ async def add_event_start(message: types.Message, state: FSMContext, **kwargs):
 async def cancel_operation(message: types.Message, state: FSMContext, **kwargs):
     await state.set_state(Form.in_calendar)
     await message.answer("❌ Операция отменена.", reply_markup=get_calendar_menu())
+
 
 @dp.message(Form.waiting_for_event_date)
 @access_check
@@ -705,13 +793,16 @@ async def process_event_date(message: types.Message, state: FSMContext, **kwargs
     except ValueError:
         await message.answer("❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ ЧЧ:ММ (например, 31.12.2025 15:00)")
 
+
 @dp.message(Form.waiting_for_event_text)
 @access_check
 @admin_check
 async def process_event_text(message: types.Message, state: FSMContext, **kwargs):
     await state.update_data(event_text=message.text)
     await state.set_state(Form.waiting_for_remind_before)
-    await message.answer("За сколько часов до события напомнить? (введите целое число):", reply_markup=get_cancel_keyboard())
+    await message.answer("За сколько часов до события напомнить? (введите целое число):",
+                         reply_markup=get_cancel_keyboard())
+
 
 @dp.message(Form.waiting_for_remind_before)
 @access_check
@@ -721,15 +812,15 @@ async def process_remind_before(message: types.Message, state: FSMContext, **kwa
         hours = int(message.text)
         if hours <= 0:
             raise ValueError
-
         minutes = hours * 60
         await state.update_data(remind_before=minutes)
-
         # Переходим к вводу комментария
         await state.set_state(Form.waiting_for_comment)
-        await message.answer("💬 Добавьте комментарий к событию (или напишите '-' чтобы пропустить):", reply_markup=get_cancel_keyboard())
+        await message.answer("💬 Добавьте комментарий к событию (или напишите '-' чтобы пропустить):",
+                             reply_markup=get_cancel_keyboard())
     except ValueError:
         await message.answer("❌ Пожалуйста, введите целое положительное число часов.")
+
 
 @dp.message(Form.waiting_for_comment)
 @access_check
@@ -754,14 +845,17 @@ async def process_comment(message: types.Message, state: FSMContext, **kwargs):
     # Форматируем дату для подтверждения (в MSK)
     naive_dt = datetime.datetime.strptime(data['event_date'], "%d.%m.%Y %H:%M")
     msk_dt = naive_dt.replace(tzinfo=MSK_TZ)
+
     month_names = [
         "января", "февраля", "марта", "апреля", "мая", "июня",
         "июля", "августа", "сентября", "октября", "ноября", "декабря"
     ]
+
     day = msk_dt.day
     month = month_names[msk_dt.month - 1]
     time_str = msk_dt.strftime("%H:%M")
     formatted_date = f"{day} {month} {msk_dt.year} в {time_str}"
+
     response = (
         f"✅ Событие успешно добавлено!\n\n"
         f" Дедлайн: {formatted_date}\n"
@@ -775,6 +869,7 @@ async def process_comment(message: types.Message, state: FSMContext, **kwargs):
     await message.answer(response)
     await state.set_state(Form.in_calendar)
     await message.answer("📅 Меню календаря:", reply_markup=get_calendar_menu())
+
 
 @dp.message(Form.in_calendar, lambda message: message.text == "Мои события")
 @access_check
@@ -847,6 +942,7 @@ async def delete_event_start(message: types.Message, state: FSMContext, **kwargs
     await message.answer(response, reply_markup=get_cancel_keyboard())
     await state.set_state(Form.waiting_for_event_to_delete)
 
+
 # Обработчик для кнопки "Вернуться к меню" в календаре
 @dp.message(Form.in_calendar, lambda message: message.text == "Вернуться к меню")
 @access_check
@@ -855,7 +951,6 @@ async def calendar_back_to_main(message: types.Message, state: FSMContext, **kwa
     await state.clear()
     username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
     await message.answer("👋 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
-
 
 
 @dp.message(Form.waiting_for_event_to_delete)
@@ -878,6 +973,7 @@ async def process_event_delete(message: types.Message, state: FSMContext, **kwar
             await message.answer(f"✅ Событие с ID {event_id} успешно удалено!")
         else:
             await message.answer("❌ Событие с таким ID не найдено или вы не являетесь его создателем.")
+
     except ValueError:
         await message.answer("❌ Пожалуйста, введите числовой ID события.")
     except Exception as e:
@@ -886,8 +982,10 @@ async def process_event_delete(message: types.Message, state: FSMContext, **kwar
     finally:
         if conn:
             conn.close()
-        await state.set_state(Form.in_calendar)
-        await message.answer("📅 Меню календаря:", reply_markup=get_calendar_menu())
+
+    await state.set_state(Form.in_calendar)
+    await message.answer("📅 Меню календаря:", reply_markup=get_calendar_menu())
+
 
 @dp.message(lambda message: message.text == "Инструкции")
 @access_check
@@ -895,11 +993,12 @@ async def select_instructions(message: types.Message, state: FSMContext, **kwarg
     await state.set_state(Form.in_instructions)
     await message.answer("📋 Выбери инструкцию:", reply_markup=get_instructions_menu())
 
+
 @dp.message(lambda message: message.text == "Обучение инструкторов")
 @access_check
 async def select_instructors(message: types.Message, state: FSMContext, **kwargs):
     await state.set_state(Form.in_training)
-    await message.answer("👨‍🏫 Выбери раздел обучения:", reply_markup=get_instructors_menu())
+    await message.answer("👨🏫 Выбери раздел обучения:", reply_markup=get_instructors_menu())
 
 
 @dp.message(Form.in_instructions)
@@ -910,34 +1009,38 @@ async def process_instructions(message: types.Message, state: FSMContext, **kwar
         await cmd_start(message, state)
         return
 
-
     if message.text == "Наличные":
         await state.set_state(Form.in_section)
         await state.update_data(current_section=message.text)
         await message.answer("Наличные:", reply_markup=get_cash_menu())
+
     elif message.text == "График и зп табель":
         await state.set_state(Form.in_section)
         await state.update_data(current_section=message.text)
         await message.answer("📅 График и зп табель:", reply_markup=get_schedule_menu())
+
     elif message.text == "Инспекция ИСС":
         await state.set_state(Form.in_section)
         await state.update_data(current_section=message.text)
         await message.answer("🔍 Инспекция ИСС:", reply_markup=get_inspection_menu())
+
     elif message.text == "Как именовать отчёты":
         await message.answer("📝 Правила именования документов:\n\n"
-                "Для всех плановых мероприятий создаем новые листы (бэкапим)\n\n"
-                "• ЗП табель: ЗП Парк период\n"
-                "Пример: ЗП Кошкино 16.07.-31.07.\n\n"
-                "• Счета: Хозрасходы Парк Магазин Дата формирования счета\n"
-                "Пример: Хозрасходы Кошкино Комус 12.05.\n\n"
-                "• Отчет по наличным: Парк Хозрасходы Месяц\n"
-                "Пример: Кошкино Хозрасходы июнь\n\n"
-                "• Инспекция ИСС: Инспекция ИСС Дата\n"
-                "Пример: Инспекция ИСС 15.08.2023", reply_markup=get_instructions_menu())
+                             "Для всех плановых мероприятий создаем новые листы (бэкапим)\n\n"
+                             "• ЗП табель: ЗП Парк период\n"
+                             "Пример: ЗП Кошкино 16.07.-31.07.\n\n"
+                             "• Счета: Хозрасходы Парк Магазин Дата формирования счета\n"
+                             "Пример: Хозрасходы Кошкино Комус 12.05.\n\n"
+                             "• Отчет по наличным: Парк Хозрасходы Месяц\n"
+                             "Пример: Кошкино Хозрасходы июнь\n\n"
+                             "• Инспекция ИСС: Инспекция ИСС Дата\n"
+                             "Пример: Инспекция ИСС 15.08.2023", reply_markup=get_instructions_menu())
+
     elif message.text == "Инвентаризация":
         await state.set_state(Form.in_section)
         await state.update_data(current_section=message.text)
         await message.answer("📦 Инвентаризация:", reply_markup=get_inventory_menu())
+
     else:
         await message.answer("📋 Используйте кнопки для навигации", reply_markup=get_instructions_menu())
 
@@ -951,7 +1054,9 @@ async def process_training(message: types.Message, state: FSMContext, **kwargs):
         return
 
     if message.text == "Чек-лист стажёра":
-        await message.answer(f"https://docs.google.com/spreadsheets/d/1znrHWMowytgYcWlTZwyzJFmlh1hEL2sI-D6tnPTSYvM/edit?gid=0#gid=0")
+        await message.answer(
+            f"https://docs.google.com/spreadsheets/d/1znrHWMowytgYcWlTZwyzJFmlh1hEL2sI-D6tnPTSYvM/edit?gid=0#gid=0")
+
         try:
             # Отправляем PDF файл
             with open("чек-лист стажёры.pdf", "rb") as pdf_file:
@@ -967,7 +1072,8 @@ async def process_training(message: types.Message, state: FSMContext, **kwargs):
         except Exception as e:
             logger.error(f"Ошибка отправки PDF: {e}")
             await message.answer("❌ Произошла ошибка при отправке файла")
-        await message.answer("👨‍🏫 Выбери раздел обучения:", reply_markup=get_instructors_menu())
+
+        await message.answer("👨🏫 Выбери раздел обучения:", reply_markup=get_instructors_menu())
 
     elif message.text == "Когда выводить на полную ставку?":
         response = (
@@ -977,14 +1083,14 @@ async def process_training(message: types.Message, state: FSMContext, **kwargs):
             "✅ Правильное заполнение техники безопасности\n"
             "✅ Проведение инструктажа (вместе с картой)\n"
             "✅ Спасательные работы на время:\n"
-            "   - Спуск с этапа\n"
-            "   - Спуск с платформы\n"
-            "   - Работа в тандеме\n"
-            "   - Самоспуск\n"
+            " - Спуск с этапа\n"
+            " - Спуск с платформы\n"
+            " - Работа в тандеме\n"
+            " - Самоспуск\n"
             "✅ Надевание снаряжения (взрослое/детское, шлемы)\n"
             "✅ Уверенная работа с кассовым ПО:\n"
-            "   - Продажа билетов\n"
-            "   - Продажа сопутствующих товаров\n\n"
+            " - Продажа билетов\n"
+            " - Продажа сопутствующих товаров\n\n"
             "⏱ Оптимальное время обучения: 3-5 смен\n"
             "❌ Не рекомендуется более 7 стажерских смен"
         )
@@ -1013,7 +1119,6 @@ async def select_handbook(message: types.Message, state: FSMContext, **kwargs):
     await state.set_state(Form.in_section)
     await state.update_data(current_section="Справочник")
     await message.answer("📚 Выберите раздел:", reply_markup=get_handbook_menu())
-
 
 
 @dp.message(Form.in_section)
@@ -1090,7 +1195,7 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                         await message.answer_document(
                             BufferedInputFile(f.read(), filename=fpath)
                         )
-                        await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.2)
                 except FileNotFoundError:
                     await message.answer(f"❌ Файл не найден: {fpath}")
             await message.answer("Бланки возврата для каждого парка.", reply_markup=get_handbook_menu())
@@ -1104,7 +1209,6 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                 "Карточка ООО ПК7 Тюмень.pdf",
                 "Карточка ООО Дубрава-Парк.pdf",
             ]
-
             # Отправляем каждый файл отдельным сообщением
             for fpath in files:
                 try:
@@ -1115,7 +1219,6 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                     await asyncio.sleep(0.2)
                 except FileNotFoundError:
                     await message.answer(f"❌ Файл не найден: {fpath}")
-
             await message.answer("Карточки организаций для каждого парка.", reply_markup=get_handbook_menu())
             return
 
@@ -1128,7 +1231,7 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
         return
 
     if current_section == "Инвентаризация":
-        # Обработка видеоинструкций - ВЫНЕСЕНО ИЗ TRY БЛОКА
+        # Обработка видеоинструкций
         if data.get("subsection") == "order_videos":
             if message.text == "Назад к инвентаризации":
                 await state.update_data(subsection=None)
@@ -1144,7 +1247,6 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
             }
 
             button_text = message.text.strip()
-
             if button_text not in video_files_map:
                 await message.answer(f"❌ Неизвестный поставщик: {button_text}")
                 await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
@@ -1159,21 +1261,22 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                 await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
                 return
 
+            # ИСПРАВЛЕНИЕ: используем start_video_processing вместо send_compressed_video
             try:
-                await send_compressed_video(
+                await start_video_processing(
                     message,
+                    state,
                     input_name=video_filename,
                     caption=f"Видеоинструкция: Как оформить заказ в {button_text}"
                 )
-                await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
+                return
             except Exception as e:
                 logger.error(f"Ошибка при отправке видео {video_filename}: {e}")
                 await message.answer(f"❌ Произошла ошибка при отправке видео для {button_text}")
                 await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
+                return
 
-            return
-
-        # Остальные кнопки инвентаризации - В TRY БЛОКЕ
+        # Остальные кнопки инвентаризации
         try:
             if message.text == "Алгоритм":
                 with open("инвент алгоритм.jpg", "rb") as photo:
@@ -1230,8 +1333,6 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
             await message.answer(f"❌ Файл не найден: {e}")
             logger.error(f"File not found: {e}")
 
-
-
     if current_section == "Наличные":
         try:
             if message.text == "Алгоритм":
@@ -1250,7 +1351,7 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                 await message.answer("Выберите следующий раздел:", reply_markup=get_cash_menu())
 
             elif message.text == "Вернуться к инструкциям":
-                await state.set_state(Form.waiting_for_instructor)
+                await state.set_state(Form.in_instructions)
                 await message.answer("📋 Выбери инструкцию:", reply_markup=get_instructions_menu())
 
             elif message.text == "Вернуться к меню":
@@ -1270,12 +1371,10 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                     "2 инстр графикЗП.jpg",
                     "3 инстр графикЗП.jpg"
                 ]
-
                 for file in files:
                     with open(file, "rb") as photo:
                         await message.answer_photo(BufferedInputFile(photo.read(), filename=file))
                     await asyncio.sleep(0.5)  # Небольшая задержка между сообщениями
-
                 await message.answer("Выберите следующий раздел:", reply_markup=get_schedule_menu())
 
             elif message.text == "Как должен выглядеть результат":
@@ -1284,20 +1383,16 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                     "результат ЗП табель.jpg",
                     "результат график.jpg"
                 ]
-
                 for file in files:
                     with open(file, "rb") as photo:
                         await message.answer_photo(BufferedInputFile(photo.read(), filename=file))
                     await asyncio.sleep(0.5)  # Небольшая задержка между сообщениями
-
                 await message.answer("Выберите следующий раздел:", reply_markup=get_schedule_menu())
 
             elif message.text == "Алгоритм":
                 with open("алгоритм графикЗП.jpg", "rb") as photo:
                     await message.answer_photo(BufferedInputFile(photo.read(), filename="algorithm.jpg"))
                 await message.answer("Выберите следующий раздел:", reply_markup=get_schedule_menu())
-
-
 
             elif message.text == "Вернуться к меню":
                 await state.clear()
@@ -1315,9 +1410,7 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                 await message.answer("Выберите следующий раздел:", reply_markup=get_inspection_menu())
 
             elif message.text == "Что делать со списанным снаряжением":
-
                 await message.answer("Для таких случаев, необходимо организовать отдельное место хранения. \n\n"
-                                     
                                      "В конце сезона сообщить опер. директору.")
                 await message.answer("Выберите следующий раздел:", reply_markup=get_inspection_menu())
 
@@ -1339,13 +1432,11 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
         await cmd_start(message, state)
 
 
-
 @dp.message()
 @access_check
 async def handle_other(message: types.Message, **kwargs):
     username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
     await message.answer("ℹ Используйте кнопки меню для навигации", reply_markup=get_main_menu(username))
-
 
 
 # Новый способ запуска бота
