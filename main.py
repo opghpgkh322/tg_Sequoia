@@ -71,7 +71,7 @@ ALLOWED_USERS = {
     "@Fidel_spb"
 }
 
-ADMIN_USERS = {"@veron144ka", "@DashaRyzhova", "@Fidel_spb"}
+ADMIN_USERS = {"@burgerking312", "@veron144ka", "@DashaRyzhova", "@Fidel_spb"}
 
 
 # Функция проверки админских прав
