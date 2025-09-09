@@ -950,7 +950,7 @@ async def delete_event_start(message: types.Message, state: FSMContext, **kwargs
 async def calendar_back_to_main(message: types.Message, state: FSMContext, **kwargs):
     await state.clear()
     username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
-    await message.answer("👋 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
+    await message.answer("🌳 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
 
 
 @dp.message(Form.waiting_for_event_to_delete)
