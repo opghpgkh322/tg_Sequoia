@@ -71,7 +71,7 @@ ALLOWED_USERS = {
     "@Fidel_spb"
 }
 
-ADMIN_USERS = {"@burgerking312", "@veron144ka", "@DashaRyzhova","@Fidel_spb"}
+ADMIN_USERS = {"@veron144ka", "@DashaRyzhova", "@Fidel_spb"}
 
 
 # Функция проверки админских прав
@@ -322,36 +322,36 @@ async def start_video_processing(message: types.Message, state: FSMContext, inpu
     finally:
         VIDEO_TASKS.pop(message.chat.id, None)
 
-        # ИСПРАВЛЕНИЕ: Принудительная очистка временного файла при любом завершении
-        try:
-            output_path = (VIDEO_DIR / f"compressed_{input_name}").resolve()
-            if output_path.exists():
-                output_path.unlink()
-                logger.info(f"Временный файл {output_path.name} удален после завершения/отмены задачи")
-        except Exception as cleanup_error:
-            logger.warning(f"Не удалось удалить временный файл compressed_{input_name}: {cleanup_error}")
+    # ИСПРАВЛЕНИЕ: Принудительная очистка временного файла при любом завершении
+    try:
+        output_path = (VIDEO_DIR / f"compressed_{input_name}").resolve()
+        if output_path.exists():
+            output_path.unlink()
+            logger.info(f"Временный файл {output_path.name} удален после завершения/отмены задачи")
+    except Exception as cleanup_error:
+        logger.warning(f"Не удалось удалить временный файл compressed_{input_name}: {cleanup_error}")
 
-        # Возвращаем предыдущее состояние И данные состояния
-        data = await state.get_data()
-        prev_state = data.get("_prev_state")
-        prev_data = data.get("_prev_data", {})
+    # Возвращаем предыдущее состояние И данные состояния
+    data = await state.get_data()
+    prev_state = data.get("_prev_state")
+    prev_data = data.get("_prev_data", {})
 
-        if prev_state:
-            await state.set_state(prev_state)
-            # Восстанавливаем все данные состояния, кроме служебных
-            for key, value in prev_data.items():
-                if not key.startswith("_prev_"):
-                    await state.update_data({key: value})
-        else:
-            await state.clear()
+    if prev_state:
+        await state.set_state(prev_state)
+        # Восстанавливаем все данные состояния, кроме служебных
+        for key, value in prev_data.items():
+            if not key.startswith("_prev_"):
+                await state.update_data({key: value})
+    else:
+        await state.clear()
 
-        # Определяем правильное меню для возврата
-        if prev_data.get("subsection") == "order_videos":
-            # Если были в разделе выбора видео поставщиков - возвращаем туда
-            await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
-        else:
-            # Иначе возвращаем в основной раздел инвентаризации
-            await message.answer("📦 Инвентаризация:", reply_markup=get_inventory_menu())
+    # Определяем правильное меню для возврата
+    if prev_data.get("subsection") == "order_videos":
+        # Если были в разделе выбора видео поставщиков - возвращаем туда
+        await message.answer("Выберите поставщика:", reply_markup=get_order_video_menu())
+    else:
+        # Иначе возвращаем в основной раздел инвентаризации
+        await message.answer("📦 Инвентаризация:", reply_markup=get_inventory_menu())
 
 
 # Функция проверки доступа
@@ -443,7 +443,7 @@ def get_handbook_menu():
 
 def get_calendar_menu():
     return build_keyboard([
-        "Добавить событие", "Мои события",
+        "Добавить событие", "События",
         "Удалить событие", "Вернуться к меню"
     ], 2)
 
@@ -523,7 +523,7 @@ def get_inspection_menu():
     ], 2)
 
 
-# Функции для работы с календарем (без изменений)
+# Функции для работы с календарем (ИСПРАВЛЕНЫ)
 def save_event(event_date, event_text, remind_before, user_id, chat_id, comment=""):
     try:
         # Парсим введенную дату как наивное время (предполагаем MSK)
@@ -565,13 +565,17 @@ def save_event(event_date, event_text, remind_before, user_id, chat_id, comment=
             conn.close()
 
 
+# ИСПРАВЛЕНА: Получаем все события для всех администраторов
 def get_user_events(user_id):
-    """Получаем все будущие события пользователя"""
+    """Получаем все будущие события для админов (общий список)"""
     conn = sqlite3.connect('events.db')
     c = conn.cursor()
     now_utc = datetime.datetime.now(UTC_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    c.execute("SELECT * FROM events WHERE user_id=? AND event_date >= ? ORDER BY event_date", (user_id, now_utc))
+
+    # ИЗМЕНЕНИЕ: Получаем ВСЕ события, а не только от конкретного пользователя
+    c.execute("SELECT * FROM events WHERE event_date >= ? ORDER BY event_date", (now_utc,))
     events = c.fetchall()
+
     # Логируем структуру события
     if events:
         logger.info(f"Структура события: {len(events[0])} полей")
@@ -592,7 +596,7 @@ def get_events_to_remind():
         id, park, event_date, event_text, remind_before, user_id, chat_id, reminded, comment
     FROM events
     WHERE reminded = 0
-    AND datetime(event_date, '-' || remind_before || ' minutes') <= datetime('now')
+      AND datetime(event_date, '-' || remind_before || ' minutes') <= datetime('now')
     """
 
     try:
@@ -658,8 +662,8 @@ async def check_reminders():
                 # Формируем текст напоминания
                 reminder_text = (
                     "🌳 Напоминалка\n\n"
-                    f" Мероприятие: {event_text}\n"
-                    f" Дедлайн: {event_time_str}\n"
+                    f"📅 Мероприятие: {event_text}\n"
+                    f"⏰ Дедлайн: {event_time_str}\n"
                 )
 
                 if comment:
@@ -737,7 +741,7 @@ async def cmd_start(message: types.Message, state: FSMContext, **kwargs):
     conn.commit()
     conn.close()
 
-    await message.answer("👋 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
+    await message.answer("🌳 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
 
 
 # Обработчик для кнопки "Календарь"
@@ -753,7 +757,7 @@ async def calendar_menu(message: types.Message, state: FSMContext, **kwargs):
 @access_check
 async def handle_start_button(message: types.Message, state: FSMContext, **kwargs):
     username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
-    await message.answer("👋 Добро пожаловать! Выберите действие:",
+    await message.answer("🌳 Добро пожаловать! Выберите действие:",
                          reply_markup=get_main_menu(username))
 
 
@@ -858,9 +862,9 @@ async def process_comment(message: types.Message, state: FSMContext, **kwargs):
 
     response = (
         f"✅ Событие успешно добавлено!\n\n"
-        f" Дедлайн: {formatted_date}\n"
-        f" Мероприятие: {data['event_text']}\n"
-        f" Напоминание за {data['remind_before'] // 60} часов до события"
+        f"📅 Дедлайн: {formatted_date}\n"
+        f"📝 Мероприятие: {data['event_text']}\n"
+        f"⏰ Напоминание за {data['remind_before'] // 60} часов до события"
     )
 
     if comment:
@@ -871,25 +875,27 @@ async def process_comment(message: types.Message, state: FSMContext, **kwargs):
     await message.answer("📅 Меню календаря:", reply_markup=get_calendar_menu())
 
 
-@dp.message(Form.in_calendar, lambda message: message.text == "Мои события")
+# ИСПРАВЛЕН: Обработчик "События" теперь показывает все события
+@dp.message(Form.in_calendar, lambda message: message.text == "События")
 @access_check
 @admin_check
 async def show_user_events(message: types.Message, **kwargs):
     username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
-    events = get_user_events(username)
+    events = get_user_events(username)  # Теперь возвращает все события
 
     if not events:
-        await message.answer("📅 У вас нет предстоящих событий.", reply_markup=get_calendar_menu())
+        await message.answer("📅 Нет предстоящих событий.", reply_markup=get_calendar_menu())
         return
 
-    response = "📅 Ваши предстоящие события:\n\n"
+    response = "📅 События:\n\n"
     for event in events:
         # Правильная индексация полей
         event_id = event[0]
         event_date_utc = event[2]  # UTC время
         event_text = event[3]
         remind_minutes = event[4]
-        comment = event[8] if len(event) > 8 else ""  # Комментарий (с проверкой)
+        creator_user_id = event[5]  # Кто создал событие
+        comment = event[8] if len(event) > 8 else ""  # Комментарий
 
         # Конвертируем UTC в MSK
         utc_dt = datetime.datetime.strptime(event_date_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC_TZ)
@@ -900,8 +906,9 @@ async def show_user_events(message: types.Message, **kwargs):
         hours = remind_minutes // 60
 
         response += f"🆔 ID: {event_id}\n"
-        response += f" Время: {event_time}\n"
-        response += f" Мероприятие: {event_text}\n"
+        response += f"📅 Время: {event_time}\n"
+        response += f"📝 Мероприятие: {event_text}\n"
+        response += f"👤 Создал: {creator_user_id}\n"  # Показываем кто создал
         if comment:
             response += f"💬 Комментарий: {comment}\n"
         response += f"⏱ Напоминание за {hours} часов до события\n"
@@ -910,23 +917,25 @@ async def show_user_events(message: types.Message, **kwargs):
     await message.answer(response, reply_markup=get_calendar_menu())
 
 
+# ИСПРАВЛЕН: Функция начала удаления события теперь показывает все события
 @dp.message(Form.in_calendar, lambda message: message.text == "Удалить событие")
 @access_check
 @admin_check
 async def delete_event_start(message: types.Message, state: FSMContext, **kwargs):
     username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
-    events = get_user_events(username)
+    events = get_user_events(username)  # Получаем все события
 
     if not events:
-        await message.answer("📅 У вас нет предстоящих событий для удаления.", reply_markup=get_calendar_menu())
+        await message.answer("📅 Нет предстоящих событий для удаления.", reply_markup=get_calendar_menu())
         return
 
-    # Формируем список событий с ID
-    response = "📅 Ваши предстоящие события:\n\n"
+    # Формируем список всех событий с ID
+    response = "📅 Все предстоящие события:\n\n"
     for event in events:
         event_id = event[0]
         event_date_utc = event[2]
         event_text = event[3]
+        creator_user_id = event[5]  # Кто создал
 
         # Конвертируем в MSK
         utc_dt = datetime.datetime.strptime(event_date_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC_TZ)
@@ -936,9 +945,11 @@ async def delete_event_start(message: types.Message, state: FSMContext, **kwargs
         response += f"🆔 ID: {event_id}\n"
         response += f"⏰ Время: {event_time}\n"
         response += f"📝 Событие: {event_text}\n"
+        response += f"👤 Создал: {creator_user_id}\n"
         response += "────────────────────\n"
 
-    response += "\nВведите ID события, которое хотите удалить (или нажмите 'Отмена'):"
+    response += "\n⚠️ Вы можете удалить ЛЮБОЕ событие из списка.\n"
+    response += "Введите ID события, которое хотите удалить (или нажмите 'Отмена'):"
     await message.answer(response, reply_markup=get_cancel_keyboard())
     await state.set_state(Form.waiting_for_event_to_delete)
 
@@ -950,9 +961,10 @@ async def delete_event_start(message: types.Message, state: FSMContext, **kwargs
 async def calendar_back_to_main(message: types.Message, state: FSMContext, **kwargs):
     await state.clear()
     username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
-    await message.answer("🌳 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
+    await message.answer("🌳 Выберите действие:", reply_markup=get_main_menu(username))
 
 
+# ИСПРАВЛЕН: Обработчик удаления события - админы могут удалять все события
 @dp.message(Form.waiting_for_event_to_delete)
 @access_check
 async def process_event_delete(message: types.Message, state: FSMContext, **kwargs):
@@ -961,18 +973,32 @@ async def process_event_delete(message: types.Message, state: FSMContext, **kwar
         event_id = int(message.text)
         username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
 
-        # Проверяем существование события и принадлежность пользователю
+        # ИЗМЕНЕНИЕ: Проверяем только существование события, не проверяем владельца
         conn = sqlite3.connect('events.db')
         c = conn.cursor()
-        c.execute("SELECT id FROM events WHERE id=? AND user_id=?", (event_id, username))
-        event_exists = c.fetchone()
 
-        if event_exists:
+        # Сначала получаем информацию о событии для логирования
+        c.execute("SELECT id, event_text, user_id FROM events WHERE id=?", (event_id,))
+        event_info = c.fetchone()
+
+        if event_info:
+            event_id_db, event_text, original_creator = event_info
+
+            # Удаляем событие БЕЗ проверки владельца (админы могут удалять все)
             c.execute("DELETE FROM events WHERE id=?", (event_id,))
             conn.commit()
-            await message.answer(f"✅ Событие с ID {event_id} успешно удалено!")
+
+            # Логируем кто удалил чье событие
+            logger.info(f"Админ {username} удалил событие ID {event_id} (создатель: {original_creator})")
+
+            await message.answer(
+                f"✅ Событие ID {event_id} успешно удалено!\n"
+                f"📝 Событие: {event_text}\n"
+                f"👤 Было создано: {original_creator}\n"
+                f"🗑 Удалено админом: {username}"
+            )
         else:
-            await message.answer("❌ Событие с таким ID не найдено или вы не являетесь его создателем.")
+            await message.answer("❌ Событие с таким ID не найдено.")
 
     except ValueError:
         await message.answer("❌ Пожалуйста, введите числовой ID события.")
@@ -1083,14 +1109,14 @@ async def process_training(message: types.Message, state: FSMContext, **kwargs):
             "✅ Правильное заполнение техники безопасности\n"
             "✅ Проведение инструктажа (вместе с картой)\n"
             "✅ Спасательные работы на время:\n"
-            " - Спуск с этапа\n"
-            " - Спуск с платформы\n"
-            " - Работа в тандеме\n"
-            " - Самоспуск\n"
+            "  - Спуск с этапа\n"
+            "  - Спуск с платформы\n"
+            "  - Работа в тандеме\n"
+            "  - Самоспуск\n"
             "✅ Надевание снаряжения (взрослое/детское, шлемы)\n"
             "✅ Уверенная работа с кассовым ПО:\n"
-            " - Продажа билетов\n"
-            " - Продажа сопутствующих товаров\n\n"
+            "  - Продажа билетов\n"
+            "  - Продажа сопутствующих товаров\n\n"
             "⏱ Оптимальное время обучения: 3-5 смен\n"
             "❌ Не рекомендуется более 7 стажерских смен"
         )
@@ -1130,7 +1156,7 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
     if message.text == "Вернуться к меню":
         await state.clear()
         username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
-        await message.answer("👋 Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(username))
+        await message.answer("🌳 Выберите действие:", reply_markup=get_main_menu(username))
         return
 
     # Новый раздел: Справочник
@@ -1312,15 +1338,15 @@ async def process_section(message: types.Message, state: FSMContext, **kwargs):
                     "• Если > 5000р. - оформляй по безналу или согласуй с опер.диром\n\n"
                     "🔹 МНЕ СРОЧНО\n"
                     "• Если счёт требует срочной оплаты не в день инвентаризации:\n"
-                    " Оформляй и отправляй в беседу со словом 'СРОЧНО'\n\n"
+                    "  Оформляй и отправляй в беседу со словом 'СРОЧНО'\n\n"
                     "🔹 OZON\n"
                     "• Заказы с Ozon нежелательны (проблемы с документами у бухгалтерии)\n"
                     "• Допустимы только редкие заказы, в основном заказываем у основных поставщиков\n\n"
                     "🔹 Нам доставили гайковерт, но он не подходит. Что делать?\n"
                     "• Если заказали неподходящий товар по безналу:\n"
-                    " 1. Сообщи офис-менеджеру\n"
-                    " 2. Оформи доверенность на возврат\n"
-                    " 3. Верни товар в магазин с доверенностью"
+                    "  1. Сообщи офис-менеджеру\n"
+                    "  2. Оформи доверенность на возврат\n"
+                    "  3. Верни товар в магазин с доверенностью"
                 )
                 await message.answer(faq_text)
                 await message.answer("Выберите следующий раздел:", reply_markup=get_inventory_menu())
